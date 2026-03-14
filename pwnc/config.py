@@ -26,7 +26,7 @@ def locate_global_config_directory():
 def load_global_config():
     config_path = config = locate_global_config_directory() / CONFIG_FILE
     if not config_path.exists():
-        config_path.parent.mkdir(exist_ok=True)
+        config_path.parent.mkdir(exist_ok=True, parents=True)
         with open(config_path, "w+") as fp:
             fp.write(DEFAULT_GLOBAL_CONFIG)
             # toml.dump(DEFAULT_GLOBAL_CONFIG, fp)
