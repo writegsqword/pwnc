@@ -52,6 +52,11 @@ def get_main_parser():
     subparsers.dest = "subcommand"
 
     """
+    Command: init
+    """
+    subparser = subparsers.add_parser("init")
+
+    """
     Command: unpack
     """
     subparser = subparsers.add_parser(
@@ -231,6 +236,10 @@ command = dict(args._get_kwargs())
 
 try:
     match command.get("subcommand"):
+        case "init":
+            import pwnc.commands.init
+
+            pwnc.commands.init.command(args)
         case "unpack":
             import pwnc.commands.unpack
 

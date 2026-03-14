@@ -2,6 +2,7 @@ import subprocess
 import os
 import shutil
 import re
+import secrets
 from argparse import Namespace as Args
 from pathlib import Path
 from . import err
@@ -48,3 +49,24 @@ def backup(file: Path):
 def ensure_exists(file: Path):
     if not file.exists():
         err.fatal(f"{file} does not exist")
+
+
+def random_tmpdir(prefix="tmp-"):
+    """
+    Caller is responsible for cleaning up the directory.
+    """
+    token = secrets.token_hex(16)
+    tmpdir = Path(f"{prefix}{token}")
+    tmpdir.mkdir(exist_ok=False)
+    return tmpdir
+
+
+def find_recursive(pattern: str) -> list[Path]:
+    regex = re.compile(pattern)
+    matches = []
+    for path, dirlist, filelist in os.walk("."):
+        path = Path(path)
+        for file in filelist:
+            if regex.search(file):
+                matches.append(path / file)
+    return matches

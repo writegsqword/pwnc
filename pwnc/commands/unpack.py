@@ -1,5 +1,4 @@
 from ..util import *
-from tempfile import mkdtemp
 
 
 # is it worth it to pull in some file type recognition library?
@@ -22,7 +21,7 @@ def command(args):
 
 
 def unpack(file: Path):
-    storage = Path(mkdtemp())
+    storage = random_tmpdir().absolute()
     name = file.stem
     copy = storage / file.name
 
