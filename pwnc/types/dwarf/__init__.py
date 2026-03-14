@@ -96,7 +96,10 @@ class DwarfSource(Source):
         if section.flags & _SHF_COMPRESSED:
             content = self._decompress_section(content)
 
-        return content
+        # Store as memoryview so DwarfReader doesn't copy on each instantiation
+        if isinstance(content, memoryview):
+            return content
+        return memoryview(bytearray(content))
 
     @staticmethod
     def _decompress_section(data):
@@ -182,12 +185,19 @@ class DwarfSource(Source):
 
         return results
 
-    def _lazy_load(self, name):
-        """Lazy-load a type by parsing only the CU that contains it."""
-        if name not in self._lazy_index:
-            raise KeyError(name)
+    @staticmethod
+    def _to_key(name):
+        """Encode a user-provided str name to bytes for internal lookup."""
+        if isinstance(name, str):
+            return name.encode("utf-8")
+        return name
 
-        cu_offset, die_offset = self._lazy_index[name]
+    def _lazy_load(self, key):
+        """Lazy-load a type by parsing only the CU that contains it."""
+        if key not in self._lazy_index:
+            raise KeyError(key)
+
+        cu_offset, die_offset = self._lazy_index[key]
 
         # Find the CU boundary for this offset
         boundary = None
@@ -198,7 +208,6 @@ class DwarfSource(Source):
                     break
 
         if boundary is None:
-            # Fallback: discover boundaries and find the right one
             self._cu_boundaries = discover_cu_boundaries(self._debug_info)
             for b in self._cu_boundaries:
                 if b.offset == cu_offset:
@@ -206,9 +215,8 @@ class DwarfSource(Source):
                     break
 
         if boundary is None:
-            raise KeyError(name)
+            raise KeyError(key)
 
-        # Parse just this one CU
         cu = parse_single_cu(boundary, self._debug_info, self._debug_abbrev,
                              self._debug_str, self._debug_line_str)
         if cu.root is not None:
@@ -216,28 +224,32 @@ class DwarfSource(Source):
             self._types.update(types)
 
     def __getitem__(self, name: str) -> Type:
-        if name in self._types:
-            return self._types[name]
+        key = self._to_key(name)
+        if key in self._types:
+            return self._types[key]
 
         if self.lazy and self._lazy_index is not None:
-            if name in self._lazy_index:
-                self._lazy_load(name)
-                if name in self._types:
-                    return self._types[name]
+            if key in self._lazy_index:
+                self._lazy_load(key)
+                if key in self._types:
+                    return self._types[key]
 
         raise KeyError(name)
 
     def __contains__(self, name: str) -> bool:
-        if name in self._types:
+        key = self._to_key(name)
+        if key in self._types:
             return True
         if self.lazy and self._lazy_index is not None:
-            return name in self._lazy_index
+            return key in self._lazy_index
         return False
 
     def names(self) -> list[str]:
         if self.lazy and self._lazy_index is not None:
-            return list(self._lazy_index.keys())
-        return list(self._types.keys())
+            return [k.decode("utf-8", errors="replace")
+                    for k in self._lazy_index.keys()]
+        return [k.decode("utf-8", errors="replace")
+                for k in self._types.keys()]
 
     def __getattr__(self, name):
         if name.startswith("__"):

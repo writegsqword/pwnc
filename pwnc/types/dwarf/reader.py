@@ -3,6 +3,11 @@
 import struct
 from .constants import *
 
+# Pre-compiled struct formats — avoids re-parsing format strings on every call
+_U16 = struct.Struct("<H")
+_U32 = struct.Struct("<I")
+_U64 = struct.Struct("<Q")
+
 
 class DwarfReader:
     """Cursor-based reader over raw section bytes."""
@@ -14,16 +19,9 @@ class DwarfReader:
             self.data = memoryview(bytearray(data))
         self.offset = offset
 
-    @property
-    def pos(self):
-        return self.offset
-
-    @pos.setter
-    def pos(self, value):
-        self.offset = value
-
     def read_bytes(self, n):
-        result = bytes(self.data[self.offset : self.offset + n])
+        offset = self.offset
+        result = bytes(self.data[offset : offset + n])
         self.offset += n
         return result
 
@@ -33,17 +31,17 @@ class DwarfReader:
         return val
 
     def read_u16(self):
-        val = struct.unpack_from("<H", self.data, self.offset)[0]
+        val = _U16.unpack_from(self.data, self.offset)[0]
         self.offset += 2
         return val
 
     def read_u32(self):
-        val = struct.unpack_from("<I", self.data, self.offset)[0]
+        val = _U32.unpack_from(self.data, self.offset)[0]
         self.offset += 4
         return val
 
     def read_u64(self):
-        val = struct.unpack_from("<Q", self.data, self.offset)[0]
+        val = _U64.unpack_from(self.data, self.offset)[0]
         self.offset += 8
         return val
 
@@ -58,35 +56,40 @@ class DwarfReader:
     def read_uleb128(self):
         result = 0
         shift = 0
+        offset = self.offset
         while True:
-            byte = self.data[self.offset]
-            self.offset += 1
+            byte = self.data[offset]
+            offset += 1
             result |= (byte & 0x7F) << shift
             if (byte & 0x80) == 0:
                 break
             shift += 7
+        self.offset = offset
         return result
 
     def read_sleb128(self):
         result = 0
         shift = 0
+        offset = self.offset
         while True:
-            byte = self.data[self.offset]
-            self.offset += 1
+            byte = self.data[offset]
+            offset += 1
             result |= (byte & 0x7F) << shift
             shift += 7
             if (byte & 0x80) == 0:
                 if byte & 0x40:
                     result |= -(1 << shift)
                 break
+        self.offset = offset
         return result
 
     def read_string(self):
         start = self.offset
-        while self.data[self.offset] != 0:
-            self.offset += 1
-        result = bytes(self.data[start : self.offset]).decode("utf-8", errors="replace")
-        self.offset += 1  # skip null terminator
+        offset = self.offset
+        while self.data[offset] != 0:
+            offset += 1
+        result = bytes(self.data[start : offset])
+        self.offset = offset + 1  # skip null terminator
         return result
 
     def read_strp(self, debug_str):
@@ -263,9 +266,9 @@ class DwarfReader:
         elif form == DW_FORM_block1:
             self.offset += 1 + d[o]
         elif form == DW_FORM_block2:
-            self.offset = o + 2 + struct.unpack_from("<H", d, o)[0]
+            self.offset = o + 2 + _U16.unpack_from(d, o)[0]
         elif form == DW_FORM_block4:
-            self.offset = o + 4 + struct.unpack_from("<I", d, o)[0]
+            self.offset = o + 4 + _U32.unpack_from(d, o)[0]
         elif form == DW_FORM_strx3:
             self.offset = o + 3
         elif form == DW_FORM_indirect:
@@ -280,4 +283,4 @@ def _read_string_at(debug_str, offset):
     start = offset
     while debug_str[offset] != 0:
         offset += 1
-    return bytes(debug_str[start:offset]).decode("utf-8", errors="replace")
+    return bytes(debug_str[start:offset])

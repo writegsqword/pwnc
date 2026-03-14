@@ -94,6 +94,48 @@ DW_FORM_strx2 = 0x26
 DW_FORM_strx3 = 0x27
 DW_FORM_strx4 = 0x28
 
+# Fixed form sizes: form -> byte count.
+# None = variable length.  -1 = addr_size.  -2 = offset_size.
+FORM_FIXED_SIZE = {
+    DW_FORM_addr: -1,           # addr_size
+    DW_FORM_block2: None,
+    DW_FORM_block4: None,
+    DW_FORM_data2: 2,
+    DW_FORM_data4: 4,
+    DW_FORM_data8: 8,
+    DW_FORM_string: None,
+    DW_FORM_block: None,
+    DW_FORM_block1: None,
+    DW_FORM_data1: 1,
+    DW_FORM_flag: 1,
+    DW_FORM_sdata: None,
+    DW_FORM_strp: 4,
+    DW_FORM_udata: None,
+    DW_FORM_ref_addr: -2,       # offset_size
+    DW_FORM_ref1: 1,
+    DW_FORM_ref2: 2,
+    DW_FORM_ref4: 4,
+    DW_FORM_ref8: 8,
+    DW_FORM_ref_udata: None,
+    DW_FORM_indirect: None,
+    DW_FORM_sec_offset: -2,     # offset_size
+    DW_FORM_exprloc: None,
+    DW_FORM_flag_present: 0,
+    DW_FORM_strx: None,
+    DW_FORM_addrx: None,
+    DW_FORM_ref_sup4: 4,
+    DW_FORM_data16: 16,
+    DW_FORM_line_strp: 4,
+    DW_FORM_ref_sig8: 8,
+    DW_FORM_implicit_const: 0,
+    DW_FORM_loclistx: None,
+    DW_FORM_rnglistx: None,
+    DW_FORM_strx1: 1,
+    DW_FORM_strx2: 2,
+    DW_FORM_strx3: 3,
+    DW_FORM_strx4: 4,
+}
+
 # DWARF Encodings
 DW_ATE_address = 0x01
 DW_ATE_boolean = 0x02

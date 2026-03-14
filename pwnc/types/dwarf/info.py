@@ -66,14 +66,14 @@ def discover_cu_boundaries(debug_info):
     boundaries = []
 
     debug_info_len = len(debug_info)
-    while reader.pos < debug_info_len:
-        cu_offset = reader.pos
+    while reader.offset < debug_info_len:
+        cu_offset = reader.offset
         length = reader.read_u32()
         if length == 0xFFFFFFFF:
             raise NotImplementedError("64-bit DWARF not supported")
 
         offset_size = 4
-        cu_end = reader.pos + length
+        cu_end = reader.offset + length
         version = reader.read_u16()
 
         if version >= 5:
@@ -84,10 +84,10 @@ def discover_cu_boundaries(debug_info):
             abbrev_offset = reader.read_u32()
             addr_size = reader.read_u8()
 
-        die_start = reader.pos
+        die_start = reader.offset
         boundaries.append(CUBoundary(cu_offset, die_start, cu_end, version,
                                      abbrev_offset, addr_size, offset_size))
-        reader.pos = cu_end
+        reader.offset = cu_end
 
     return boundaries
 
@@ -139,8 +139,8 @@ def _parse_die_tree(reader, abbrev_table, addr_size, debug_str, cu_offset,
     """Parse a tree of DIEs until end of CU or a null entry at the current depth."""
     dies = []
 
-    while reader.pos < cu_end:
-        die_offset = reader.pos
+    while reader.offset < cu_end:
+        die_offset = reader.offset
         code = reader.read_uleb128()
 
         if code == 0:
@@ -174,8 +174,8 @@ def _parse_children(reader, abbrev_table, addr_size, debug_str, cu_offset,
     """Parse children DIEs until a null entry."""
     children = []
 
-    while reader.pos < cu_end:
-        die_offset = reader.pos
+    while reader.offset < cu_end:
+        die_offset = reader.offset
         code = reader.read_uleb128()
 
         if code == 0:
@@ -205,6 +205,12 @@ def _parse_children(reader, abbrev_table, addr_size, debug_str, cu_offset,
 # ── type name indexing (for lazy mode) ──────────────────────────
 
 
+_INDEX_TYPE_TAGS = frozenset({
+    DW_TAG_structure_type, DW_TAG_class_type, DW_TAG_union_type,
+    DW_TAG_enumeration_type, DW_TAG_typedef, DW_TAG_base_type,
+})
+
+
 def index_type_names(debug_info, debug_abbrev, debug_str,
                      debug_line_str=None, boundaries=None):
     """Build a lightweight index: type_name -> (cu_offset, die_offset).
@@ -212,164 +218,217 @@ def index_type_names(debug_info, debug_abbrev, debug_str,
     Used by lazy mode to know which types exist without fully parsing them.
     If boundaries is provided, skips the CU header scan.
     """
-    reader = DwarfReader(debug_info)
-    index = {}
-
-    TYPE_TAGS = {
-        DW_TAG_structure_type, DW_TAG_class_type, DW_TAG_union_type,
-        DW_TAG_enumeration_type, DW_TAG_typedef, DW_TAG_base_type,
-    }
-
     if boundaries is None:
         boundaries = discover_cu_boundaries(debug_info)
 
+    index = {}
+    reader = DwarfReader(debug_info)
+    abbrev_cache = {}
+    plans_cache = {}
+
     for boundary in boundaries:
-        reader.pos = boundary.die_start
-        abbrev_table = parse_abbrev_table(debug_abbrev, boundary.abbrev_offset)
+        # Cache abbreviation tables — many CUs share the same offset
+        aoff = boundary.abbrev_offset
+        cache_key = (aoff, boundary.addr_size, boundary.offset_size)
+        plans = plans_cache.get(cache_key)
+        if plans is None:
+            abbrev_table = abbrev_cache.get(aoff)
+            if abbrev_table is None:
+                abbrev_table = parse_abbrev_table(debug_abbrev, aoff)
+                abbrev_cache[aoff] = abbrev_table
+            plans = _build_skip_plans(
+                abbrev_table, boundary.addr_size, boundary.offset_size)
+            plans_cache[cache_key] = plans
 
-        _index_dies(reader, abbrev_table, boundary.addr_size, debug_str,
-                    boundary.offset, boundary.cu_end, TYPE_TAGS, index,
-                    debug_line_str, boundary.offset_size)
-
-        reader.pos = boundary.cu_end
+        reader.offset = boundary.die_start
+        _index_cu(reader, plans, boundary.addr_size,
+                  debug_str, debug_line_str, boundary.offset,
+                  boundary.cu_end, boundary.offset_size, index)
 
     return index
 
 
-def _precompute_abbrev_info(abbrev_table, type_tags):
-    """Pre-analyze abbreviation entries for fast indexing.
+PLAN_TYPE = 0
+PLAN_SIBLING = 1
+PLAN_SKIP = 2
 
-    For each abbrev, determine:
-    - Whether it's a type tag we care about
-    - The index of DW_AT_sibling in its attrs (for skipping subtrees)
-    - The index of DW_AT_name (for capturing type names)
+
+def _compute_fixed_skip(forms, addr_size, offset_size):
+    """Compute total byte size if all forms are fixed-size.
+
+    Returns int if all fixed, or None if any form is variable.
     """
-    info = {}
+    total = 0
+    for form in forms:
+        size = FORM_FIXED_SIZE.get(form)
+        if size is None:
+            return None  # variable-length form present
+        if size == -1:
+            total += addr_size
+        elif size == -2:
+            total += offset_size
+        else:
+            total += size
+    return total
+
+
+def _compile_skip_sequence(forms, addr_size, offset_size):
+    """Compile a list of forms into a sequence of (fixed_run, var_form) pairs.
+
+    Batches consecutive fixed-size forms into a single offset increment,
+    only calling skip_form for variable-length forms.
+    Returns list of tuples: (fixed_bytes_to_skip, variable_form_or_None)
+    """
+    seq = []
+    run = 0
+    for form in forms:
+        size = FORM_FIXED_SIZE.get(form)
+        if size is None:
+            seq.append((run, form))
+            run = 0
+        elif size == -1:
+            run += addr_size
+        elif size == -2:
+            run += offset_size
+        else:
+            run += size
+    if run > 0:
+        seq.append((run, None))
+    return seq
+
+
+def _build_skip_plans(abbrev_table, addr_size, offset_size):
+    """For each abbreviation code, build a compact plan for the indexer.
+
+    Returns dict of code -> (action, has_children, skip_spec)
+    """
+    plans = {}
+    type_tags = _INDEX_TYPE_TAGS
+
     for code, entry in abbrev_table.items():
         is_type = entry.tag in type_tags
-        sibling_idx = -1
-        name_idx = -1
-        decl_idx = -1
-        bytesize_idx = -1
-        for i, (attr, form, implicit) in enumerate(entry.attrs):
-            if attr == DW_AT_sibling:
-                sibling_idx = i
-            elif attr == DW_AT_name:
-                name_idx = i
-            elif attr == DW_AT_declaration:
-                decl_idx = i
-            elif attr == DW_AT_byte_size:
-                bytesize_idx = i
-        info[code] = (is_type, sibling_idx, name_idx, decl_idx,
-                      bytesize_idx, entry.has_children, entry.attrs)
-    return info
+        has_children = entry.has_children
+        attrs = entry.attrs
+
+        if is_type:
+            plans[code] = (PLAN_TYPE, has_children, attrs)
+        else:
+            # Find DW_AT_sibling
+            sibling_idx = -1
+            for i, (attr, form, imp) in enumerate(attrs):
+                if attr == DW_AT_sibling:
+                    sibling_idx = i
+                    break
+
+            if sibling_idx >= 0 and has_children:
+                pre_forms = [f for _, f, _ in attrs[:sibling_idx]]
+                pre_skip = _compute_fixed_skip(pre_forms, addr_size, offset_size)
+                sib_form = attrs[sibling_idx][1]
+                if pre_skip is not None:
+                    # All pre-sibling attrs are fixed size
+                    plans[code] = (PLAN_SIBLING, True,
+                                   (pre_skip, sib_form, None))
+                else:
+                    # Variable forms before sibling — compile a skip sequence
+                    pre_seq = _compile_skip_sequence(pre_forms, addr_size, offset_size)
+                    plans[code] = (PLAN_SIBLING, True,
+                                   (pre_seq, sib_form, None))
+            else:
+                all_forms = [f for _, f, _ in attrs]
+                total = _compute_fixed_skip(all_forms, addr_size, offset_size)
+                if total is not None:
+                    # All fixed — store single int
+                    plans[code] = (PLAN_SKIP, has_children, total)
+                else:
+                    # Mixed — store compiled skip sequence
+                    seq = _compile_skip_sequence(
+                        all_forms, addr_size, offset_size)
+                    plans[code] = (PLAN_SKIP, has_children, seq)
+
+    return plans
 
 
-def _index_dies(reader, abbrev_table, addr_size, debug_str,
-                cu_offset, cu_end, type_tags, index,
-                debug_line_str=None, offset_size=4):
-    """Scan DIEs and index type names without building full DIE tree.
+def _index_cu(reader, plans, addr_size, debug_str, debug_line_str,
+              cu_offset, cu_end, offset_size, index):
+    """Index one CU's DIEs for type names."""
+    skip_form = reader.skip_form
+    read_form = reader.read_form
 
-    Uses three optimizations:
-    1. DW_AT_sibling skipping — jump past subtrees we don't need
-    2. skip_form() — advance cursor without constructing Python objects
-    3. Only read attributes we need (name, declaration, byte_size)
-    """
-    abbrev_info = _precompute_abbrev_info(abbrev_table, type_tags)
-    _index_dies_fast(reader, abbrev_info, addr_size, debug_str,
-                     cu_offset, cu_end, index, debug_line_str, offset_size)
-
-
-def _index_dies_fast(reader, abbrev_info, addr_size, debug_str,
-                     cu_offset, cu_end, index, debug_line_str, offset_size):
-    """Inner indexing loop with fast attribute skipping."""
-    while reader.pos < cu_end:
-        die_offset = reader.pos
+    while reader.offset < cu_end:
+        die_offset = reader.offset
         code = reader.read_uleb128()
 
         if code == 0:
             return
 
-        if code not in abbrev_info:
-            raise ValueError(f"unknown abbreviation code {code} at offset 0x{die_offset:x}")
+        plan = plans.get(code)
+        if plan is None:
+            raise ValueError(
+                f"unknown abbreviation code {code} at offset 0x{die_offset:x}")
 
-        is_type, sibling_idx, name_idx, decl_idx, bytesize_idx, \
-            has_children, attrs = abbrev_info[code]
+        action = plan[0]
+        has_children = plan[1]
+        spec = plan[2]
 
-        if not is_type:
-            # Not a type DIE. Try to skip as efficiently as possible.
-            if sibling_idx >= 0 and has_children:
-                # Has DW_AT_sibling — read just enough to get the sibling
-                # offset, then jump there (skipping entire subtree).
-                for i, (attr, form, implicit) in enumerate(attrs):
-                    if i == sibling_idx:
-                        sibling_off = reader.read_form(
-                            form, addr_size, debug_str, cu_offset,
-                            debug_line_str, implicit, offset_size)
-                        # Skip remaining attrs
-                        for j in range(i + 1, len(attrs)):
-                            reader.skip_form(attrs[j][1], addr_size, offset_size)
-                        # Jump to sibling (skips all children)
-                        reader.pos = sibling_off
-                        break
-                    else:
-                        reader.skip_form(form, addr_size, offset_size)
+        if action == PLAN_SKIP:
+            if isinstance(spec, int):
+                # All-fixed: single offset jump
+                reader.offset += spec
             else:
-                # No sibling — skip all attrs, recurse into children
-                # (children may still contain type definitions)
-                for attr, form, implicit in attrs:
-                    reader.skip_form(form, addr_size, offset_size)
-                if has_children:
-                    _index_dies_fast(reader, abbrev_info, addr_size, debug_str,
-                                     cu_offset, cu_end, index,
-                                     debug_line_str, offset_size)
+                # Mixed: batched fixed runs + variable skips
+                for fixed_run, var_form in spec:
+                    reader.offset += fixed_run
+                    if var_form is not None:
+                        skip_form(var_form, addr_size, offset_size)
+            if has_children:
+                _index_cu(reader, plans, addr_size, debug_str,
+                          debug_line_str, cu_offset, cu_end,
+                          offset_size, index)
+
+        elif action == PLAN_SIBLING:
+            pre_skip, sib_form, _ = spec
+            if isinstance(pre_skip, int):
+                reader.offset += pre_skip
+            else:
+                # pre_skip is a compiled skip sequence
+                for fixed_run, var_form in pre_skip:
+                    reader.offset += fixed_run
+                    if var_form is not None:
+                        skip_form(var_form, addr_size, offset_size)
+            sibling_off = read_form(sib_form, addr_size, debug_str,
+                                    cu_offset, debug_line_str, None,
+                                    offset_size)
+            reader.offset = sibling_off
+
         else:
-            # Type DIE — read name, declaration, byte_size; skip the rest
+            # PLAN_TYPE — extract name, check declaration/byte_size
             name = None
             is_declaration = False
             has_byte_size = False
 
-            for i, (attr, form, implicit) in enumerate(attrs):
-                if i == name_idx:
-                    name = reader.read_form(
-                        form, addr_size, debug_str, cu_offset,
-                        debug_line_str, implicit, offset_size)
-                elif i == decl_idx:
-                    val = reader.read_form(
-                        form, addr_size, debug_str, cu_offset,
-                        debug_line_str, implicit, offset_size)
+            for attr, form, implicit in spec:
+                if attr == DW_AT_name:
+                    name = read_form(form, addr_size, debug_str,
+                                     cu_offset, debug_line_str,
+                                     implicit, offset_size)
+                elif attr == DW_AT_declaration:
+                    val = read_form(form, addr_size, debug_str,
+                                    cu_offset, debug_line_str,
+                                    implicit, offset_size)
                     if val:
                         is_declaration = True
-                elif i == bytesize_idx:
-                    reader.skip_form(form, addr_size, offset_size)
+                elif attr == DW_AT_byte_size:
+                    skip_form(form, addr_size, offset_size)
                     has_byte_size = True
                 else:
-                    reader.skip_form(form, addr_size, offset_size)
+                    skip_form(form, addr_size, offset_size)
 
-            if name is not None and not (is_declaration and not has_byte_size):
-                if name not in index:
-                    index[name] = (cu_offset, die_offset)
+            if name is not None:
+                if not (is_declaration and not has_byte_size):
+                    if name not in index:
+                        index[name] = (cu_offset, die_offset)
 
             if has_children:
-                # Recurse into children to find nested type definitions
-                _index_dies_fast(reader, abbrev_info, addr_size, debug_str,
-                                 cu_offset, cu_end, index,
-                                 debug_line_str, offset_size)
-
-
-def _skip_children(reader, abbrev_info, addr_size, offset_size):
-    """Skip all children DIEs until the null terminator."""
-    while True:
-        code = reader.read_uleb128()
-        if code == 0:
-            return
-
-        if code not in abbrev_info:
-            return
-
-        _, _, _, _, _, has_children, attrs = abbrev_info[code]
-
-        for attr, form, implicit in attrs:
-            reader.skip_form(form, addr_size, offset_size)
-        if has_children:
-            _skip_children(reader, abbrev_info, addr_size, offset_size)
+                _index_cu(reader, plans, addr_size, debug_str,
+                          debug_line_str, cu_offset, cu_end,
+                          offset_size, index)

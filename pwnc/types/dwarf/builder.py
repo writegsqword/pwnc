@@ -5,6 +5,13 @@ from ..primitives import Int, Bits, Float, Double, Ptr
 from ..containers import Struct, Union, Array, Enum, Pad
 
 
+def _s(val):
+    """Decode a bytes name to str. Pass through str and None."""
+    if isinstance(val, bytes):
+        return val.decode("utf-8", errors="replace")
+    return val
+
+
 class TypeBuilder:
     """Converts a DIE tree (from a compilation unit) into Type objects.
 
@@ -145,7 +152,7 @@ class TypeBuilder:
         if die.attr(DW_AT_declaration) and die.attr(DW_AT_byte_size) is None:
             return None
 
-        name = die.attr(DW_AT_name) or self._make_anon_name()
+        name = _s(die.attr(DW_AT_name)) or self._make_anon_name()
         byte_size = die.attr(DW_AT_byte_size, 0)
 
         # Collect all field entries with their DWARF offsets
@@ -187,7 +194,7 @@ class TypeBuilder:
             if child.attr(DW_AT_external):
                 continue
 
-            member_name = child.attr(DW_AT_name)
+            member_name = _s(child.attr(DW_AT_name))
             member_type = self._resolve_type_ref(child)
             if member_type is None:
                 continue
@@ -261,14 +268,14 @@ class TypeBuilder:
         if die.attr(DW_AT_declaration) and die.attr(DW_AT_byte_size) is None:
             return None
 
-        name = die.attr(DW_AT_name) or self._make_anon_name()
+        name = _s(die.attr(DW_AT_name)) or self._make_anon_name()
 
         fields = []
         for child in die.children:
             if child.tag != DW_TAG_member:
                 continue
 
-            member_name = child.attr(DW_AT_name)
+            member_name = _s(child.attr(DW_AT_name))
             member_type = self._resolve_type_ref(child)
             if member_type is None or member_name is None:
                 continue
@@ -278,7 +285,7 @@ class TypeBuilder:
         return Union(name, fields)
 
     def _build_enum(self, die):
-        name = die.attr(DW_AT_name)
+        name = _s(die.attr(DW_AT_name))
         byte_size = die.attr(DW_AT_byte_size, 4)
         encoding = die.attr(DW_AT_encoding)
 
@@ -296,7 +303,7 @@ class TypeBuilder:
         for child in die.children:
             if child.tag != DW_TAG_enumerator:
                 continue
-            ename = child.attr(DW_AT_name)
+            ename = _s(child.attr(DW_AT_name))
             evalue = child.attr(DW_AT_const_value, 0)
             if ename is not None:
                 members[ename] = evalue
@@ -350,7 +357,7 @@ class TypeBuilder:
 
     def _build_typedef(self, die):
         underlying = self._resolve_type_ref(die)
-        td_name = die.attr(DW_AT_name)
+        td_name = _s(die.attr(DW_AT_name))
         if underlying is not None:
             # If the underlying type is an anonymous struct/union (generated name),
             # propagate the typedef name so it displays as e.g.
