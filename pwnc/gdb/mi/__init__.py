@@ -6,16 +6,14 @@ Public API:
     attach(pid)  — attach to a running process
 """
 
+import base64
+import io
 import os
-import socket
-import tempfile
+import pickle
 
 from .process import GdbProcess
-from .protocol import Connection
-from .proxy import (
-    PROXY_CLASSES, ProxyBase, BreakpointProxy, InferiorProxy,
-    FrameProxy, ThreadProxy,
-)
+from .protocol import Return, Error
+from .proxy import PROXY_CLASSES, BreakpointProxy, InferiorProxy, FrameProxy, ThreadProxy
 from pwnc.types.provider import BytesProvider, ByteOrder
 from pwnc.types.primitives import Int, Float, Double, Ptr
 from pwnc.types.containers import Struct, Union, Array, Enum
@@ -49,8 +47,70 @@ def pwnc_type_from_desc(desc):
                     desc["members"], name=desc.get("name"))
     if kind == "void":
         return None
-    # fallback
     return Int(desc.get("bits", 8), signed=False)
+
+
+# --- MI-based bridge connection ---
+
+_RESULT_MARKER = "__PWNC_RESULT__:"
+
+
+class BridgeConnection:
+    """RPC connection to the bridge via MI interpreter-exec commands.
+
+    Each call serializes (method, args, kwargs) as pickle → base64,
+    executes it as a GDB python command, and reads the pickled result
+    from the console stream output.
+    """
+
+    def __init__(self, process, proxy_classes=None):
+        self._process = process
+        self._proxy_classes = proxy_classes or {}
+
+    def call(self, method, *args, **kwargs):
+        # serialize request
+        payload = pickle.dumps((method, args, kwargs))
+        b64 = base64.b64encode(payload).decode()
+
+        # execute via MI console → runs on GDB main thread
+        output = self._process.console(f'python _pwnc_dispatch("{b64}")')
+
+        # find the result marker in output
+        for line in output.split('\n'):
+            if line.startswith(_RESULT_MARKER):
+                result_b64 = line[len(_RESULT_MARKER):]
+                result_data = base64.b64decode(result_b64)
+                buf = io.BytesIO(result_data)
+                unpickler = _ProxyUnpickler(buf, self._proxy_classes, self)
+                result = unpickler.load()
+
+                if isinstance(result, Return):
+                    return result.value
+                elif isinstance(result, Error):
+                    raise RuntimeError(f"Bridge error: {result.exception}")
+                else:
+                    raise RuntimeError(f"Unexpected bridge response: {result}")
+
+        raise RuntimeError(f"No bridge result in output: {output[:200]}")
+
+    def close(self):
+        pass
+
+
+class _ProxyUnpickler(pickle.Unpickler):
+    """Unpickler that reconstructs GDB proxy objects."""
+
+    def __init__(self, f, proxy_classes, conn):
+        super().__init__(f)
+        self.proxy_classes = proxy_classes
+        self.conn = conn
+
+    def persistent_load(self, pid):
+        type_name, oid = pid
+        cls = self.proxy_classes.get(type_name)
+        if cls is None:
+            raise pickle.UnpicklingError(f"Unknown proxy type: {type_name}")
+        return cls(self.conn, oid)
 
 
 # --- Remote bytes provider ---
@@ -90,11 +150,9 @@ class SymbolAccessor:
         if addr is None:
             raise AttributeError(f"Symbol '{name}' has no address")
 
-        # convert type descriptor to pwnc type
         if desc is not None:
             ptype = pwnc_type_from_desc(desc)
         else:
-            # fallback: u8*
             ptype = Ptr(Int(8), bits=64)
 
         if ptype is None:
@@ -126,44 +184,25 @@ class Gdb:
 
     def __init__(self, gdb_path="gdb", env=None):
         self.process = GdbProcess(gdb_path=gdb_path, env=env)
-        self.conn: Connection | None = None
+        self.conn: BridgeConnection | None = None
         self.sym: SymbolAccessor | None = None
         self.reg: Registers | None = None
-        self._socket_path: str | None = None
-        self._bridge_sock: socket.socket | None = None
+        self._bp_callbacks: dict[int, callable] = {}
 
     def _start_bridge(self):
-        """Start the bridge inside GDB and connect to it."""
-        # create a temp socket path
-        self._socket_path = tempfile.mktemp(prefix="pwnc_bridge_", suffix=".sock")
-
-        # find the bridge script
+        """Load the bridge script inside GDB."""
         bridge_path = os.path.join(os.path.dirname(__file__), "bridge.py")
 
-        # set env var and source the bridge
+        # ensure pwnc is importable inside GDB's python
+        project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', '..'))
         self.process.console(
-            f'python import os; os.environ["_PWNC_BRIDGE_SOCKET"] = "{self._socket_path}"'
+            f'python import sys; sys.path.insert(0, "{project_root}") if "{project_root}" not in sys.path else None'
         )
+
+        # source the bridge
         self.process.console(f'python exec(open("{bridge_path}").read())')
 
-        # connect to the bridge socket
-        self._bridge_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-
-        # retry connection briefly (bridge needs a moment to bind)
-        import time
-        for _ in range(50):
-            try:
-                self._bridge_sock.connect(self._socket_path)
-                break
-            except (ConnectionRefusedError, FileNotFoundError):
-                time.sleep(0.1)
-        else:
-            raise RuntimeError("Failed to connect to GDB bridge")
-
-        self.conn = Connection(
-            self._bridge_sock,
-            proxy_classes=PROXY_CLASSES,
-        )
+        self.conn = BridgeConnection(self.process, proxy_classes=PROXY_CLASSES)
 
         # detect byte order
         endian = self.conn.call("get_endian")
@@ -175,86 +214,101 @@ class Gdb:
     # --- Execution control ---
 
     def run(self, *args):
-        """Start the program. MI: -exec-run"""
         self.process.command("exec-run")
 
     def cont(self):
-        """Continue execution. MI: -exec-continue"""
         self.process.command("exec-continue")
 
     def interrupt(self):
-        """Interrupt (pause) execution. MI: -exec-interrupt"""
         self.process.command("exec-interrupt")
 
     def stepi(self):
-        """Step one machine instruction (into calls). MI: -exec-step-instruction"""
         self.process.command("exec-step-instruction")
 
     def nexti(self):
-        """Step one machine instruction (over calls). MI: -exec-next-instruction"""
         self.process.command("exec-next-instruction")
 
     def step(self):
-        """Step one source line (into calls). MI: -exec-step"""
         self.process.command("exec-step")
 
     def next(self):
-        """Step one source line (over calls). MI: -exec-next"""
         self.process.command("exec-next")
 
     def skip(self):
-        """Skip current instruction without executing it."""
         self.conn.call("skip_instruction")
 
     def wait(self):
-        """Block until inferior stops. Returns stop reason dict."""
-        return self.process.wait_for_stop()
+        """Block until the inferior stops.
+
+        If the stop is a breakpoint-hit with a registered callback,
+        the callback is invoked with this Gdb instance.  If the
+        callback returns anything other than ``False``, execution
+        automatically continues and ``wait`` keeps waiting for the
+        next stop.
+
+        Returns the stop-reason dict for the stop that was *not*
+        handled by a callback (or where the callback returned
+        ``False``).
+        """
+        while True:
+            stop = self.process.wait_for_stop()
+            if stop.get("reason") == "breakpoint-hit":
+                bkptno = stop.get("bkptno")
+                if bkptno is not None:
+                    cb = self._bp_callbacks.get(int(bkptno))
+                    if cb is not None:
+                        result = cb(self)
+                        if result is not False:
+                            self.cont()
+                            continue
+            return stop
 
     # --- Breakpoints ---
 
-    def bp(self, location, **kwargs) -> BreakpointProxy:
-        """Set a breakpoint. Returns a BreakpointProxy."""
-        return self.conn.call("create_breakpoint", location, **kwargs)
+    def bp(self, location, callback=None, **kwargs) -> BreakpointProxy:
+        """Set a breakpoint.  Returns a BreakpointProxy.
+
+        If *callback* is given it is called as ``callback(gdb)`` each
+        time the breakpoint is hit during ``wait()``.  The callback
+        receives this ``Gdb`` instance and can freely read/write
+        registers, memory, symbols, etc.
+
+        * Return anything (or ``None``) → auto-continue.
+        * Return ``False``              → stop; ``wait()`` returns.
+        """
+        bp = self.conn.call("create_breakpoint", location, **kwargs)
+        if callback is not None:
+            self._bp_callbacks[bp.number] = callback
+        return bp
 
     # --- Direct access ---
 
     def inferior(self) -> InferiorProxy:
-        """Get the selected inferior."""
         return self.conn.call("selected_inferior")
 
     def frame(self) -> FrameProxy:
-        """Get the selected frame."""
         return self.conn.call("selected_frame")
 
     def thread(self) -> ThreadProxy:
-        """Get the selected thread."""
         return self.conn.call("selected_thread")
 
     # --- Console ---
 
     def execute(self, cmd: str) -> str:
-        """Execute a GDB CLI command and return its output."""
         return self.process.console(cmd)
 
     # --- Memory convenience ---
 
     def read(self, addr, size) -> bytes:
-        """Read memory from the inferior."""
         return bytes(self.conn.call("read_memory", addr, size))
 
     def write(self, addr, data):
-        """Write memory to the inferior."""
         self.conn.call("write_memory", addr, bytes(data))
 
     # --- Lifecycle ---
 
     def close(self):
-        """Shut down GDB and clean up."""
-        if self.conn:
-            self.conn.close()
         self.process.close()
-        if self._socket_path and os.path.exists(self._socket_path):
-            os.unlink(self._socket_path)
 
     def __enter__(self):
         return self
@@ -266,7 +320,6 @@ class Gdb:
 # --- Convenience constructors ---
 
 def debug(program, *args, gdb_path="gdb", env=None, **kwargs) -> Gdb:
-    """Spawn GDB on a program, start the bridge, and return a Gdb instance."""
     g = Gdb(gdb_path=gdb_path, env=env)
     extra = []
     if args:
@@ -278,13 +331,11 @@ def debug(program, *args, gdb_path="gdb", env=None, **kwargs) -> Gdb:
 
 
 def attach(pid_or_name, gdb_path="gdb", env=None, **kwargs) -> Gdb:
-    """Attach GDB to a running process (by PID or name)."""
     g = Gdb(gdb_path=gdb_path, env=env)
 
     if isinstance(pid_or_name, int):
         g.process.start(pid=pid_or_name)
     else:
-        # look up PID by name
         import shutil
         pidof = shutil.which("pidof")
         if pidof:

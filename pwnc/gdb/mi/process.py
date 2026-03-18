@@ -67,10 +67,17 @@ class GdbProcess:
         self._wait_ready()
 
     def _wait_ready(self):
-        """Wait for the initial (gdb) prompt by consuming startup output."""
-        # The reader thread handles parsing; we just need to wait briefly
-        # for GDB to be ready. We do this by sending a no-op command.
-        pass  # reader thread is already consuming output
+        """Wait for GDB to finish loading and be ready for commands."""
+        # Send a no-op MI command and wait for its result. This ensures
+        # all startup output (gdbinit, GEF, etc.) has been processed.
+        token = self._next_token()
+        future = Future()
+        with self._lock:
+            self._pending[token] = future
+        line = f"{token}-gdb-set mi-async on\n"
+        self.proc.stdin.write(line.encode())
+        self.proc.stdin.flush()
+        future.result(timeout=30)
 
     def _next_token(self) -> int:
         with self._lock:
@@ -106,6 +113,7 @@ class GdbProcess:
 
         with self._lock:
             self._pending[token] = future
+        with self._console_lock:
             self._console_buf.clear()
 
         line = f'{token}-interpreter-exec console "{escaped}"\n'

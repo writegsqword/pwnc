@@ -62,16 +62,27 @@ class BridgePickler(pickle.Pickler):
         return None
 
 
+_MSG_CLASSES = {'Call': Call, 'Return': Return, 'Error': Error, 'Release': Release}
+
+
 class BridgeUnpickler(pickle.Unpickler):
     """Unpickler that reconstructs proxy references into proxy objects.
 
     Used on the client side. proxy_classes is injected by the client.
+    Also resolves protocol message classes via find_class so that
+    messages from the bridge (which may define its own class variants)
+    are unpickled into our local dataclass versions.
     """
 
     def __init__(self, f, proxy_classes=None, conn=None):
         super().__init__(f)
         self.proxy_classes = proxy_classes or {}
         self.conn = conn
+
+    def find_class(self, module, name):
+        if name in _MSG_CLASSES:
+            return _MSG_CLASSES[name]
+        return super().find_class(module, name)
 
     def persistent_load(self, pid):
         type_name, oid = pid

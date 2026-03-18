@@ -1,45 +1,18 @@
 """GDB-side bridge script — runs inside the GDB Python interpreter.
 
-Provides RPC access to GDB's Python API over a Unix socket.
-Loaded by GdbProcess via: python exec(open('bridge.py').read())
+Provides RPC access to GDB's Python API. Handlers are invoked via
+MI interpreter-exec commands, avoiding GDB's thread-safety issues.
 """
 
+import base64
 import io
 import os
 import pickle
-import queue
-import socket
-import struct
-import threading
 import traceback
 
+from pwnc.gdb.mi.protocol import Call, Return, Error, Release
 
-# --- Wire format helpers (duplicated here to avoid import from host) ---
-
-class Call:
-    __slots__ = ('id', 'method', 'args', 'kwargs')
-    def __init__(self, id, method, args, kwargs):
-        self.id = id
-        self.method = method
-        self.args = args
-        self.kwargs = kwargs
-
-class Return:
-    __slots__ = ('id', 'value')
-    def __init__(self, id, value):
-        self.id = id
-        self.value = value
-
-class Error:
-    __slots__ = ('id', 'exception')
-    def __init__(self, id, exception):
-        self.id = id
-        self.exception = exception
-
-class Release:
-    __slots__ = ('oid',)
-    def __init__(self, oid):
-        self.oid = oid
+import gdb
 
 
 # --- Object store for proxy references ---
@@ -47,9 +20,7 @@ class Release:
 object_store = {}
 
 
-# --- GDB type proxy serialization ---
-
-import gdb
+# --- Proxy serialization ---
 
 PROXY_TYPES = (
     gdb.InferiorThread,
@@ -70,11 +41,6 @@ class BridgePickler(pickle.Pickler):
                 object_store[oid] = obj
                 return (type(obj).__name__, oid)
         return None
-
-
-class BridgeUnpickler(pickle.Unpickler):
-    """Client-side objects aren't proxied back — use default unpickling."""
-    pass
 
 
 # --- RPC handlers ---
@@ -133,15 +99,13 @@ def selected_thread():
 
 @handler("lookup_symbol")
 def lookup_symbol(name):
-    result = gdb.lookup_symbol(name)
-    return result  # (Symbol, is_field_of_this) or (None, False)
+    return gdb.lookup_symbol(name)
 
 
 @handler("read_memory")
 def read_memory(addr, size):
     inf = gdb.selected_inferior()
-    mv = inf.read_memory(addr, size)
-    return bytes(mv)
+    return bytes(inf.read_memory(addr, size))
 
 
 @handler("write_memory")
@@ -181,8 +145,25 @@ def create_breakpoint(spec, **kwargs):
 @handler("resolve_type")
 def resolve_type(name):
     """Look up a symbol, return (type_desc, address) for pwnc.types construction."""
-    result = gdb.lookup_symbol(name)
-    sym = result[0]
+    sym = None
+    try:
+        result = gdb.lookup_symbol(name)
+        sym = result[0]
+    except gdb.error:
+        pass
+
+    if sym is None:
+        try:
+            sym = gdb.lookup_global_symbol(name)
+        except Exception:
+            pass
+
+    if sym is None:
+        try:
+            sym = gdb.lookup_static_symbol(name)
+        except Exception:
+            pass
+
     if sym is None:
         return None
 
@@ -192,8 +173,7 @@ def resolve_type(name):
         addr = None
 
     try:
-        gdb_type = sym.type
-        desc = gdb_type_to_pwnc(gdb_type)
+        desc = gdb_type_to_pwnc(sym.type)
     except Exception:
         desc = None
 
@@ -251,115 +231,42 @@ def gdb_type_to_pwnc(gdb_type):
 
 @handler("get_endian")
 def get_endian():
-    """Return the target byte order as 'little' or 'big'."""
     endian = gdb.execute("show endian", to_string=True)
     if "little" in endian:
         return "little"
     return "big"
 
 
-# --- Socket server ---
+# --- Dispatch entry point ---
+# Called via MI: -interpreter-exec console "python _pwnc_dispatch('...')"
+# Payload is a base64-encoded pickle of (method, args, kwargs).
+# Response is printed as base64-encoded pickle, read from console stream.
 
-def _recvall(sock, n):
-    parts = []
-    remaining = n
-    while remaining > 0:
-        chunk = sock.recv(remaining)
-        if not chunk:
-            return None
-        parts.append(chunk)
-        remaining -= len(chunk)
-    return b''.join(parts)
+def _pwnc_dispatch(b64_payload):
+    """Dispatch an RPC call. Runs on GDB's main thread via MI."""
+    try:
+        payload = base64.b64decode(b64_payload)
+        method, args, kwargs = pickle.loads(payload)
 
-
-def _send_msg(sock, msg):
-    buf = io.BytesIO()
-    p = BridgePickler(buf)
-    p.dump(msg)
-    data = buf.getvalue()
-    header = struct.pack('>I', len(data))
-    sock.sendall(header + data)
-
-
-def _recv_msg(sock):
-    header = _recvall(sock, 4)
-    if header is None:
-        return None
-    length = struct.unpack('>I', header)[0]
-    data = _recvall(sock, length)
-    if data is None:
-        return None
-    buf = io.BytesIO(data)
-    u = BridgeUnpickler(buf)
-    return u.load()
-
-
-def _handle_client(conn_sock):
-    """Handle a single client connection."""
-    while True:
-        msg = _recv_msg(conn_sock)
-        if msg is None:
-            break
-
-        if isinstance(msg, Call):
-            h = handlers.get(msg.method)
-            if h is None:
-                _send_msg(conn_sock, Error(id=msg.id,
-                          exception=f"Unknown method: {msg.method}"))
-                continue
-
-            # execute handler via gdb.post_event for thread safety
-            result_q = queue.Queue()
-
-            def do_call(handler=h, call_msg=msg, rq=result_q):
-                try:
-                    result = handler(*call_msg.args, **call_msg.kwargs)
-                    rq.put(Return(id=call_msg.id, value=result))
-                except Exception:
-                    rq.put(Error(id=call_msg.id,
-                                exception=traceback.format_exc()))
-
-            gdb.post_event(do_call)
-            response = result_q.get()
-            _send_msg(conn_sock, response)
-
-        elif isinstance(msg, Release):
-            object_store.pop(msg.oid, None)
-
-
-def start_bridge(socket_path):
-    """Start the bridge server on a Unix socket.
-
-    Called by GdbProcess after spawning GDB.
-    """
-    if os.path.exists(socket_path):
-        os.unlink(socket_path)
-
-    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    server.bind(socket_path)
-    server.listen(1)
-
-    # signal ready by printing to stdout (captured by GdbProcess)
-    print(f"BRIDGE_READY:{socket_path}", flush=True)
-
-    def accept_loop():
-        while True:
+        h = handlers.get(method)
+        if h is None:
+            result = Error(id=0, exception=f"Unknown method: {method}")
+        else:
             try:
-                conn_sock, _ = server.accept()
-                _handle_client(conn_sock)
+                value = h(*args, **kwargs)
+                result = Return(id=0, value=value)
             except Exception:
-                traceback.print_exc()
-                break
+                result = Error(id=0, exception=traceback.format_exc())
 
-    t = threading.Thread(target=accept_loop, daemon=True)
-    t.start()
-
-
-# --- Auto-start when sourced ---
-
-import sys as _sys
-
-if __name__ == '__main__' or '_PWNC_BRIDGE_SOCKET' in os.environ:
-    _socket_path = os.environ.get('_PWNC_BRIDGE_SOCKET', '')
-    if _socket_path:
-        start_bridge(_socket_path)
+        # Pickle the result with proxy serialization
+        buf = io.BytesIO()
+        p = BridgePickler(buf)
+        p.dump(result)
+        encoded = base64.b64encode(buf.getvalue()).decode()
+        # Print with a marker so client can find it in console output
+        print(f"__PWNC_RESULT__:{encoded}", flush=True)
+    except Exception:
+        err = base64.b64encode(
+            pickle.dumps(Error(id=0, exception=traceback.format_exc()))
+        ).decode()
+        print(f"__PWNC_RESULT__:{err}", flush=True)

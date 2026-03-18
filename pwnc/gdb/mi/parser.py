@@ -57,7 +57,6 @@ _SIMPLE_ESCAPES = {
     'b': '\b',
     'f': '\f',
     'v': '\v',
-    '0': '\0',
 }
 
 
@@ -188,20 +187,29 @@ def _parse_list(s: str, pos: int) -> tuple[list | dict, int]:
             raise ValueError(f"Expected ',' or ']' at position {pos}")
 
 
-def _parse_kv_list(s: str, pos: int) -> tuple[dict, int]:
-    """Parse a list of key-value pairs (returned as dict)."""
-    result = {}
+def _parse_kv_list(s: str, pos: int) -> tuple[dict | list, int]:
+    """Parse a list of key-value pairs.
+
+    Returns a dict if all keys are unique.
+    Returns a list of values if any key repeats (common in MI: [frame={},frame={}]).
+    """
+    pairs = []
     while True:
         key, pos = _parse_variable(s, pos)
         if pos >= len(s) or s[pos] != '=':
             raise ValueError(f"Expected '=' at position {pos}")
         pos += 1
         val, pos = _parse_value(s, pos)
-        result[key] = val
+        pairs.append((key, val))
         if pos >= len(s):
             raise ValueError("Unterminated kv-list")
         if s[pos] == ']':
-            return result, pos + 1
+            # check for duplicate keys
+            keys = [k for k, v in pairs]
+            if len(keys) == len(set(keys)):
+                return {k: v for k, v in pairs}, pos + 1
+            else:
+                return [v for k, v in pairs], pos + 1
         if s[pos] == ',':
             pos += 1
 
