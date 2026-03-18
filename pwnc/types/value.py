@@ -1,7 +1,7 @@
 import struct as _struct
-from .base import Type, BoundField
-from .provider import BytesProvider, BufferProvider, ByteOrder
-
+from .provider import BufferProvider, ByteOrder
+from .primitives import Int, Bits, Float, Double, Ptr
+from .containers import Struct, Union, Array, Enum
 
 class Value:
     def __init__(self, type, provider, base_offset):
@@ -40,8 +40,6 @@ class Value:
 
     def _resolve(self):
         """Resolve this value to a Python object (int, float, etc.)."""
-        from .primitives import Int, Bits, Float, Double, Ptr
-        from .containers import Struct, Union, Array, Enum
 
         ty = self._type
 
@@ -86,8 +84,6 @@ class Value:
 
     def _write(self, ty, offset, value):
         """Write a Python value to the provider at the given offset."""
-        from .primitives import Int, Bits, Float, Double, Ptr
-        from .containers import Enum
 
         if isinstance(ty, Enum):
             ty = ty.child
@@ -120,9 +116,6 @@ class Value:
             object.__setattr__(self, name, value)
             return
 
-        from .primitives import Int, Bits, Float, Double, Ptr
-        from .containers import Struct, Union, Array, Enum
-
         ty = self._type
         if not isinstance(ty, (Struct, Union)):
             raise AttributeError(f"cannot set fields on {type(ty).__name__} value")
@@ -148,9 +141,6 @@ class Value:
     def __getattr__(self, name):
         if name.startswith("__"):
             raise AttributeError(name)
-
-        from .primitives import Int, Bits, Float, Double, Ptr
-        from .containers import Struct, Union, Array, Enum
 
         ty = self._type
 
@@ -180,13 +170,11 @@ class Value:
         raise AttributeError(f"Value has no attribute '{name}'")
 
     def __getitem__(self, index):
-        from .containers import Array
         if isinstance(self._type, Array):
             return ArrayValue(self._type, self._provider, self._base_offset)[index]
         raise TypeError(f"Value of type {type(self._type).__name__} is not subscriptable")
 
     def __setitem__(self, index, value):
-        from .containers import Array
         if isinstance(self._type, Array):
             ArrayValue(self._type, self._provider, self._base_offset)[index] = value
             return
@@ -197,9 +185,6 @@ class Value:
         return format_value(self, depth=depth, filter=filter)
 
     def __str__(self):
-        from .primitives import Int, Bits, Float, Double, Ptr
-        from .containers import Struct, Union, Array, Enum
-
         ty = self._type
         if isinstance(ty, (Int, Float, Double, Ptr)):
             val = self._resolve()
@@ -234,9 +219,6 @@ class ArrayValue(Value):
         super().__init__(type, provider, base_offset)
 
     def __getitem__(self, index):
-        from .primitives import Int, Bits, Float, Double, Ptr
-        from .containers import Enum
-
         child = self._type.child
         elem_offset = self._base_offset + index * child.nbytes
         elem_val = Value(child, self._provider, elem_offset)
@@ -247,9 +229,6 @@ class ArrayValue(Value):
         return elem_val
 
     def __setitem__(self, index, value):
-        from .primitives import Int, Bits, Float, Double, Ptr
-        from .containers import Enum
-
         child = self._type.child
         elem_offset = self._base_offset + index * child.nbytes
         elem_val = Value(child, self._provider, elem_offset)
@@ -259,8 +238,6 @@ class ArrayValue(Value):
         return self._type.count
 
     def __str__(self):
-        from .primitives import Int, Bits, Float, Double, Ptr
-
         ty = self._type
         if ty.count == 0:
             return "[]"

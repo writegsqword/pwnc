@@ -1,6 +1,5 @@
 from .base import Type
 
-
 class Int(Type):
     def __init__(self, bits, signed=False):
         super().__init__(bits)

@@ -1,11 +1,10 @@
-import fnmatch
-
+import re
+from .primitives import Int, Bits, Float, Double, Ptr
+from .containers import Struct, Union, Array, Enum
+from .value import Value, ArrayValue
 
 def _type_str(ty):
     """Short type string for a field (e.g. 'u32', 'f32', 'struct Vec3')."""
-    from .primitives import Int, Bits, Float, Double, Ptr
-    from .containers import Struct, Union, Array, Enum
-
     if isinstance(ty, Bits):
         return f"bits({ty.nbits})"
     if isinstance(ty, Int):
@@ -34,9 +33,6 @@ def _type_str(ty):
 
 def _field_type_str(ty):
     """Type prefix for field display (no array suffix, that goes after the name)."""
-    from .containers import Array, Enum
-    from .primitives import Ptr
-
     if isinstance(ty, Array):
         return _type_str(ty.child)
     return _type_str(ty)
@@ -44,8 +40,6 @@ def _field_type_str(ty):
 
 def _field_suffix(ty):
     """Suffix after field name (array brackets)."""
-    from .containers import Array
-
     if isinstance(ty, Array):
         if ty.count == 0:
             return "[]"
@@ -53,12 +47,44 @@ def _field_suffix(ty):
     return ""
 
 
-def format_type(ty, depth=None, filter=None, _indent=0, _seen=None):
-    from .primitives import Int, Bits, Float, Double, Ptr
-    from .containers import Struct, Union, Array, Enum
-
+def _max_nesting(ty, _seen=None):
+    """Compute the maximum nesting depth of a container type."""
     if _seen is None:
         _seen = set()
+    if not isinstance(ty, (Struct, Union)):
+        return 0
+    if id(ty) in _seen:
+        return 0
+    _seen.add(id(ty))
+    child_max = 0
+    for _, ftype in ty._fields:
+        child_max = max(child_max, _max_nesting(ftype, _seen))
+    return 1 + child_max
+
+
+def _resolve_depth(depth, ty):
+    """Resolve depth to an internal countdown value.
+
+    depth=None or 0: infinite (returns None)
+    depth>0: show depth-1 layers of fields (1=collapse, 2=one layer, ...)
+    depth<0: show all except |depth| deepest layers
+    """
+    if depth is None or depth == 0:
+        return None
+    if depth > 0:
+        return depth
+    # Negative: compute max nesting, subtract
+    max_d = _max_nesting(ty)
+    resolved = max_d + depth  # e.g. max=4, depth=-1 -> 3
+    return max(1, resolved)  # at least 1 (collapse everything)
+
+
+def format_type(ty, depth=None, filter=None, _indent=0, _seen=None):
+    if _seen is None:
+        _seen = set()
+
+    if filter:
+        filter = re.compile(filter)
 
     if isinstance(ty, (Int, Float, Double, Ptr)):
         return str(ty)
@@ -73,15 +99,13 @@ def format_type(ty, depth=None, filter=None, _indent=0, _seen=None):
         return str(ty)
 
     if isinstance(ty, (Struct, Union)):
-        return _format_container(ty, depth, filter, _indent, _seen)
+        resolved = _resolve_depth(depth, ty)
+        return _format_container(ty, resolved, filter, _indent, _seen)
 
     return str(ty)
 
 
-def _format_container(ty, depth, filter, indent, seen):
-    from .primitives import Bits
-    from .containers import Struct, Union, Array, Enum
-
+def _format_container(ty, depth, filter, indent, seen, base_offset=0):
     kind = "struct" if isinstance(ty, Struct) else "union"
     prefix = "    " * indent
     inner_prefix = "    " * (indent + 1)
@@ -92,10 +116,11 @@ def _format_container(ty, depth, filter, indent, seen):
     lines = [header]
 
     ty_id = id(ty)
-    is_repeat = ty_id in seen
+    # Only deduplicate when depth is limited; at depth=None (show all), always expand
+    is_repeat = depth is not None and ty_id in seen
     seen.add(ty_id)
 
-    if is_repeat or (depth is not None and depth < 1):
+    if is_repeat or (depth is not None and depth <= 1):
         lines = [f"{prefix}{kind} {ty.name} {{ ... }}"]
         return "\n".join(lines)
 
@@ -118,52 +143,55 @@ def _format_container(ty, depth, filter, indent, seen):
     for entry in entries:
         if entry[0] == "padding":
             _, _, _, pad_off, pad_size = entry
-            lines.append(f"{inner_prefix}/* 0x{pad_off:02x} padding({pad_size}) */")
+            lines.append(f"{inner_prefix}/* 0x{pad_off + base_offset:02x} padding({pad_size}) */")
         else:
             _, fname, ftype, byte_off, bit_off = entry
 
             # apply filter
-            if filter is not None and not fnmatch.fnmatch(fname, filter):
+            if filter is not None and not filter.search(fname):
                 continue
 
+            abs_off = byte_off + base_offset
+
             if isinstance(ftype, Bits):
-                offset_str = f"0x{byte_off:02x}:{bit_off}"
+                offset_str = f"0x{abs_off:02x}:{bit_off}"
             else:
-                offset_str = f"0x{byte_off:02x}"
+                offset_str = f"0x{abs_off:02x}"
 
             # nested container
             if isinstance(ftype, (Struct, Union)):
                 nested_kind = "struct" if isinstance(ftype, Struct) else "union"
-                if ftype_id_seen(ftype, seen) or (child_depth is not None and child_depth < 1):
+                if (child_depth is not None and (ftype_id_seen(ftype, seen) or child_depth <= 1)):
                     lines.append(f"{inner_prefix}/* {offset_str} */ {nested_kind} {ftype.name} {{ ... }} {fname};")
                 else:
-                    nested = _format_container(ftype, child_depth, None, indent + 1, seen)
-                    # split nested into lines, first line gets offset prefix
+                    nested = _format_container(ftype, child_depth, None, indent + 1, seen, abs_off)
                     nested_lines = nested.split("\n")
-                    lines.append(f"{inner_prefix}/* {offset_str} */ {nested_lines[0].lstrip()}")
-                    for nl in nested_lines[1:-1]:
-                        lines.append(nl)
-                    # closing brace + field name
-                    lines.append(f"{inner_prefix}}} {fname};")
+                    if len(nested_lines) == 1:
+                        # Collapsed to single line
+                        lines.append(f"{inner_prefix}{nested_lines[0].lstrip()} {fname};")
+                    else:
+                        lines.append(f"{inner_prefix}{nested_lines[0].lstrip()}")
+                        for nl in nested_lines[1:-1]:
+                            lines.append(nl)
+                        lines.append(f"{inner_prefix}}} {fname};")
             elif isinstance(ftype, Enum):
                 type_label = _type_str(ftype)
                 lines.append(f"{inner_prefix}/* {offset_str} */ {type_label} {fname};")
             elif isinstance(ftype, Array):
                 elem_type = _field_type_str(ftype)
                 suffix = _field_suffix(ftype)
-                # offset with extra spacing for alignment with bit fields
                 if any(isinstance(ft, Bits) for _, ft in ty._fields):
-                    lines.append(f"{inner_prefix}/* {offset_str}   */ {elem_type} {fname}{suffix};")
+                    lines.append(f"{inner_prefix}/* {offset_str} */ {elem_type} {fname}{suffix};")
                 else:
                     lines.append(f"{inner_prefix}/* {offset_str} */ {elem_type} {fname}{suffix};")
             else:
                 type_label = _type_str(ftype)
-                # if struct has bit fields, add spacing for non-bit fields
                 if isinstance(ty, Struct) and any(isinstance(ft, Bits) for _, ft in ty._fields) and not isinstance(ftype, Bits):
-                    lines.append(f"{inner_prefix}/* {offset_str}   */ {type_label} {fname};")
+                    lines.append(f"{inner_prefix}/* {offset_str} */ {type_label} {fname};")
                 else:
                     lines.append(f"{inner_prefix}/* {offset_str} */ {type_label} {fname};")
 
+    lines.append(f"{inner_prefix}/* total size: 0x{ty.nbytes:x} */")
     lines.append(f"{prefix}}}")
     return "\n".join(lines)
 
@@ -173,28 +201,33 @@ def ftype_id_seen(ftype, seen):
 
 
 def format_value(val, depth=None, filter=None, _indent=0):
-    from .primitives import Int, Bits, Float, Double, Ptr
-    from .containers import Struct, Union, Array, Enum
-    from .value import Value, ArrayValue
+    if filter:
+        filter = re.compile(filter)
 
     ty = val._type
     prefix = "    " * _indent
     inner_prefix = "    " * (_indent + 1)
 
     if isinstance(ty, (Struct, Union)):
+        depth = _resolve_depth(depth, ty)
         name = ty.name
         lines = [f"{prefix}{name} {{"]
+
+        if depth is not None and depth <= 1:
+            lines.append(f"{inner_prefix}...")
+            lines.append(f"{prefix}}}")
+            return "\n".join(lines)
 
         child_depth = depth - 1 if depth is not None else None
 
         for fname, ftype, byte_off, bit_off in ty._layout:
-            if filter is not None and not fnmatch.fnmatch(fname, filter):
+            if filter is not None and not filter.search(fname):
                 continue
 
             field_offset = val._base_offset + byte_off
             field_val = Value(ftype, val._provider, field_offset)
 
-            if isinstance(ftype, Bits) and bit_off is not None:
+            if isinstance(ftype, Bits):
                 field_val._bit_offset = bit_off
 
             if isinstance(ftype, (Struct, Union)):

@@ -1,6 +1,4 @@
-import math
 from .base import Type, BoundField
-from .primitives import Bits
 
 
 class Align:
@@ -11,28 +9,6 @@ class Align:
 class Pad:
     def __init__(self, n):
         self.size = n
-
-
-def _natural_alignment(ty):
-    """Get the natural alignment of a type for cstyle layout."""
-    from .primitives import Int, Float, Double, Ptr
-    if isinstance(ty, (Int, Float, Double, Ptr)):
-        return ty.nbytes
-    if isinstance(ty, Bits):
-        return 1
-    if isinstance(ty, Array):
-        return _natural_alignment(ty.child)
-    if isinstance(ty, Enum):
-        return _natural_alignment(ty.child)
-    if isinstance(ty, Struct):
-        if not ty._fields:
-            return 1
-        return max((_natural_alignment(f[1]) for f in ty._fields), default=1)
-    if isinstance(ty, Union):
-        if not ty._fields:
-            return 1
-        return max((_natural_alignment(f[1]) for f in ty._fields), default=1)
-    return 1
 
 
 def _align_up(offset, alignment):
@@ -50,84 +26,39 @@ class Struct(Type):
 
         current_byte = 0
         current_bit = 0  # bit offset within current byte (for Bits fields)
-        in_bitfield = False
 
         for item in fields:
             if isinstance(item, Align):
                 # finish any pending bitfield
-                if in_bitfield and current_bit > 0:
-                    remaining = 8 - current_bit
+                if current_bit != 0:
+                    current_byte += 1
                     current_bit = 0
-                    in_bitfield = False
-                    # the partial byte was already counted
                 aligned = _align_up(current_byte, item.alignment)
                 if aligned > current_byte:
                     self._padding.append((current_byte, aligned - current_byte))
                     current_byte = aligned
             elif isinstance(item, Pad):
-                if in_bitfield and current_bit > 0:
+                if current_bit != 0:
+                    current_byte += 1
                     current_bit = 0
-                    in_bitfield = False
                 self._padding.append((current_byte, item.size))
                 current_byte += item.size
             else:
                 fname, ftype = item
-                is_bits = isinstance(ftype, Bits)
 
-                if is_bits:
-                    if not in_bitfield:
-                        in_bitfield = True
-                        current_bit = 0
-                    # check if this Bits field fits in the current byte
-                    if current_bit + ftype.nbits > 8:
-                        # move to next byte
-                        current_byte += 1
-                        current_bit = 0
-
-                    bit_off = current_bit
-                    self._fields.append((fname, ftype))
-                    idx = len(self._layout)
-                    self._layout.append((fname, ftype, current_byte, bit_off))
-                    self._field_map[fname] = idx
-                    current_bit += ftype.nbits
-                    # if we filled a byte exactly, advance
-                    while current_bit >= 8:
-                        current_byte += 1
-                        current_bit -= 8
-                else:
-                    # non-Bits field: close bitfield if open
-                    if in_bitfield and current_bit > 0:
-                        # partial byte used, advance past it
-                        current_byte += 1
-                        current_bit = 0
-                    in_bitfield = False
-
-                    if mode == "cstyle":
-                        alignment = _natural_alignment(ftype)
-                        aligned = _align_up(current_byte, alignment)
-                        if aligned > current_byte:
-                            self._padding.append((current_byte, aligned - current_byte))
-                            current_byte = aligned
-
-                    self._fields.append((fname, ftype))
-                    idx = len(self._layout)
-                    self._layout.append((fname, ftype, current_byte, None))
-                    self._field_map[fname] = idx
-                    current_byte += ftype.nbytes
+                self._fields.append((fname, ftype))
+                idx = len(self._layout)
+                self._layout.append((fname, ftype, current_byte, current_byte * 8 + current_bit))
+                self._field_map[fname] = idx
+                new_bit = current_bit + ftype.nbits
+                current_byte += new_bit >> 3
+                current_bit = new_bit & 7
 
         # close trailing bitfield
-        if in_bitfield and current_bit > 0:
+        if current_bit != 0:
             current_byte += 1
             current_bit = 0
-
-        # cstyle trailing padding
-        if mode == "cstyle" and self._fields:
-            struct_align = max((_natural_alignment(f[1]) for f in self._fields), default=1)
-            aligned = _align_up(current_byte, struct_align)
-            if aligned > current_byte:
-                self._padding.append((current_byte, aligned - current_byte))
-                current_byte = aligned
-
+            
         super().__init__(current_byte * 8)
 
     @classmethod
@@ -147,6 +78,11 @@ class Struct(Type):
         idx = self._field_map[name]
         fname, ftype, byte_off, bit_off = self._layout[idx]
         return BoundField(ftype, byte_off, bit_off)
+
+    def fields(self):
+        """Yield (name, BoundField) pairs in layout order."""
+        for fname, ftype, byte_off, bit_off in self._layout:
+            yield fname, BoundField(ftype, byte_off, bit_off)
 
     def __getattr__(self, name):
         try:
@@ -192,6 +128,11 @@ class Union(Type):
         idx = self._field_map[name]
         fname, ftype, byte_off, bit_off = self._layout[idx]
         return BoundField(ftype, byte_off, bit_off)
+
+    def fields(self):
+        """Yield (name, BoundField) pairs in layout order."""
+        for fname, ftype, byte_off, bit_off in self._layout:
+            yield fname, BoundField(ftype, byte_off, bit_off)
 
     def __getattr__(self, name):
         try:

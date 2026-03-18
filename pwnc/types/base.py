@@ -1,5 +1,3 @@
-import math
-
 
 class Type:
     def __init__(self, nbits):
@@ -11,12 +9,11 @@ class Type:
 
     @property
     def nbytes(self):
-        return math.ceil(self._nbits / 8)
+        return (self._nbits + 7) >> 3
 
     def use(self, data):
         from .value import Value
         from .provider import BytesProvider, BufferProvider, ByteOrder
-
         if isinstance(data, BytesProvider):
             provider = data
         else:
@@ -35,7 +32,7 @@ class Type:
 
 
 class BoundField:
-    def __init__(self, type, offset, bit_offset=None):
+    def __init__(self, type, offset, bit_offset):
         self._type = type
         self._offset = offset
         self._bit_offset = bit_offset

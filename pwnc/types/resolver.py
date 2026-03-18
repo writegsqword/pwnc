@@ -12,6 +12,15 @@ class Source(ABC):
     @abstractmethod
     def names(self) -> list[str]: ...
 
+    @abstractmethod
+    def hash(self) -> bytes | None:
+        """Return a hash identifying this source's content, or None if not cacheable."""
+        ...
+
+    def __del__(self):
+        """Called on destruction. Subclasses override to flush caches."""
+        pass
+
 
 class StaticSource(Source):
     def __init__(self, types):
@@ -34,6 +43,9 @@ class StaticSource(Source):
 
     def names(self) -> list[str]:
         return list(self._types.keys())
+
+    def hash(self) -> bytes | None:
+        return None
 
 
 class Types:
@@ -75,8 +87,6 @@ class Types:
         return result
 
     def __getattr__(self, name):
-        if name.startswith("__"):
-            raise AttributeError(name)
         try:
             return self[name]
         except KeyError:

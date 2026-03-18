@@ -13,10 +13,7 @@ class DwarfReader:
     """Cursor-based reader over raw section bytes."""
 
     def __init__(self, data, offset=0):
-        if isinstance(data, memoryview):
-            self.data = data
-        else:
-            self.data = memoryview(bytearray(data))
+        self.data = data
         self.offset = offset
 
     def read_bytes(self, n):
