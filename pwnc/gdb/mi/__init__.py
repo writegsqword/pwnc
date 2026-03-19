@@ -254,36 +254,19 @@ class Gdb:
         self.sym: SymbolAccessor | None = None
         self.reg: Registers | None = None
         self.target = None  # pwntools process (set by debug())
-        self._console_kid = None  # kitty window id for console UI
+        self._console_proc = None  # kitty subprocess for console UI
         self._bp_callbacks: dict[int, callable] = {}
 
     def _start_console(self):
-        """Spawn a kitty window and attach GDB's console UI to it."""
-        import json
+        """Spawn a kitty terminal and attach GDB's console UI to it."""
         import subprocess as _sp
 
-        kid = _sp.check_output(
-            ["kitten", "@", "launch", "--keep-focus", "--cwd=current"],
-            text=True,
-        ).strip()
-
-        # Find the window's shell PID to get its TTY
-        windows = json.loads(_sp.check_output(["kitten", "@", "ls"], text=True))
-        pid = None
-        for os_window in windows:
-            for tab in os_window["tabs"]:
-                for w in tab["windows"]:
-                    if str(w["id"]) == kid:
-                        pid = w["pid"]
-                        break
-
-        tty = _sp.check_output(
-            ["ps", "-p", str(pid), "-o", "tty="], text=True,
-        ).strip()
-        tty_path = f"/dev/{tty}"
-
+        self._console_proc = _sp.Popen(
+            ["kitty", "--hold", "-e", "sh", "-c", "tty; exec sleep infinity"],
+            stdout=_sp.PIPE,
+        )
+        tty_path = self._console_proc.stdout.readline().decode().strip()
         self.process.console(f"new-ui console {tty_path}")
-        self._console_kid = kid
 
     def _start_bridge(self):
         """Load the bridge script inside GDB."""
@@ -411,10 +394,9 @@ class Gdb:
         self.process.close()
         if self.target is not None:
             self.target.close()
-        if self._console_kid is not None:
-            import subprocess as _sp
-            _sp.run(["kitten", "@", "close-window", "--match",
-                     f"id:{self._console_kid}"], capture_output=True)
+        if self._console_proc is not None:
+            self._console_proc.kill()
+            self._console_proc.wait()
 
     def __enter__(self):
         return self
