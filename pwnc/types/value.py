@@ -21,17 +21,6 @@ class Value:
     def address(self):
         return self._provider.address + self._base_offset
 
-    def ref(self, bits=64):
-        try:
-            addr = self.address
-        except TypeError:
-            raise TypeError("ref() requires a remote-backed value (no address available for local buffers)")
-        ptr_type = Ptr(self._type, bits=bits)
-        bo = self._provider.byteorder
-        byte_order = "little" if bo == ByteOrder.Little else "big"
-        buf = addr.to_bytes(ptr_type.nbytes, byte_order)
-        return Value(ptr_type, BufferProvider(bytearray(buf), bo), 0)
-
     @property
     def offset(self):
         return self._base_offset
@@ -48,6 +37,12 @@ class Value:
     def bytes(self):
         return self._provider.read(self._base_offset, self._type.nbytes)
 
+    @bytes.setter
+    def bytes(self, data):
+        if len(data) != self._type.nbytes:
+            raise ValueError(f"expected {self._type.nbytes} bytes, got {len(data)}")
+        self._provider.write(self._base_offset, bytes(data))
+
     def use(self, data):
         return self._type.use(data)
 
@@ -59,7 +54,7 @@ class Value:
     def cast(self, target):
         if isinstance(target, Value):
             target = target._type
-        return Value(target, self._provider, self._base_offset)
+        return type(self)(target, self._provider, self._base_offset)
 
     def _resolve(self):
         """Resolve this value to a Python object (int, float, etc.)."""
@@ -109,8 +104,7 @@ class Value:
         """Write a Python value to the provider at the given offset."""
 
         if isinstance(value, Value):
-            if isinstance(value._type, (Int, Enum, Ptr)):
-                value = value._resolve()
+            value = value._resolve()
 
         if isinstance(ty, Enum):
             ty = ty.child
@@ -167,22 +161,18 @@ class Value:
         if isinstance(ty, (Struct, Union)):
             bf = getattr(ty, name)  # returns BoundField
             new_offset = self._base_offset + bf.offset
-            child_val = Value(bf._type, self._provider, new_offset)
 
-            # for Bits fields, attach bit_offset
-            if isinstance(bf._type, Bits) and bf.bit_offset is not None:
-                object.__setattr__(child_val, '_bit_offset', bf.bit_offset)
-
-            # if child is a primitive, resolve immediately
+            # if child is a primitive, return a typed value
             if isinstance(bf._type, (Int, Float, Double, Enum)):
-                return child_val._resolve()
+                return _typed_value(bf._type, self._provider, new_offset,
+                                    bf.bit_offset if isinstance(bf._type, Bits) else None)
 
             # if child is Array, return a ArrayValue
             if isinstance(bf._type, Array):
                 return ArrayValue(bf._type, self._provider, new_offset)
 
             # containers return Value (lazy)
-            return child_val
+            return type(self)(bf._type, self._provider, new_offset)
 
         raise AttributeError(f"Value has no attribute '{name}'")
 
@@ -194,12 +184,11 @@ class Value:
             child = self._type.child
             target_addr = addr + index * child.nbytes
             new_provider = self._provider.rebase(target_addr)
-            child_val = Value(child, new_provider, 0)
             if isinstance(child, (Int, Float, Double, Enum)):
-                return child_val._resolve()
+                return _typed_value(child, new_provider, 0)
             if isinstance(child, Array):
                 return ArrayValue(child, new_provider, 0)
-            return child_val
+            return type(self)(child, new_provider, 0)
         if isinstance(self._type, Array):
             return ArrayValue(self._type, self._provider, self._base_offset)[index]
         raise TypeError(f"Value of type {type(self._type).__name__} is not subscriptable")
@@ -269,7 +258,7 @@ class Value:
 
     def _ptr_result(self, addr):
         new_provider = self._provider.rebase(addr)
-        return Value(self._type, new_provider, 0)
+        return type(self)(self._type, new_provider, 0)
 
     # --- Arithmetic operators ---
 
@@ -478,12 +467,11 @@ class ArrayValue(Value):
     def __getitem__(self, index):
         child = self._type.child
         elem_offset = self._base_offset + index * child.nbytes
-        elem_val = Value(child, self._provider, elem_offset)
 
         if isinstance(child, (Int, Float, Double, Enum)):
-            return elem_val._resolve()
+            return _typed_value(child, self._provider, elem_offset)
 
-        return elem_val
+        return Value(child, self._provider, elem_offset)
 
     def __setitem__(self, index, value):
         child = self._type.child
@@ -507,3 +495,192 @@ class ArrayValue(Value):
         if ty.count > max_show:
             return "[" + ", ".join(items[:-1]) + ", ...]"
         return "[" + ", ".join(items) + "]"
+
+
+# ══════════════════════════════════════════════════════════════════
+#  Operator helpers for typed Value subclasses
+# ══════════════════════════════════════════════════════════════════
+
+import operator
+
+_COMMON_OPS = [
+    ('add', operator.add), ('sub', operator.sub), ('mul', operator.mul),
+    ('truediv', operator.truediv), ('floordiv', operator.floordiv),
+    ('mod', operator.mod), ('pow', operator.pow),
+]
+_BITWISE_OPS = [
+    ('and', operator.and_), ('or', operator.or_), ('xor', operator.xor),
+    ('lshift', operator.lshift), ('rshift', operator.rshift),
+]
+
+
+def _make_forward(op):
+    def method(self, other):
+        return self._wrap(op(self.val, self._other_val(other)))
+    return method
+
+
+def _make_reverse(op):
+    def method(self, other):
+        return self._wrap(op(self._other_val(other), self.val))
+    return method
+
+
+def _make_inplace(op):
+    def method(self, other):
+        wrapped = self._wrap(op(self.val, self._other_val(other)))
+        self._write(self._type, self._base_offset, wrapped.val)
+        return self
+    return method
+
+
+def _install_ops(cls, ops):
+    for name, op in ops:
+        setattr(cls, f'__{name}__', _make_forward(op))
+        setattr(cls, f'__r{name}__', _make_reverse(op))
+        setattr(cls, f'__i{name}__', _make_inplace(op))
+
+
+# ══════════════════════════════════════════════════════════════════
+#  Typed Value subclasses
+# ══════════════════════════════════════════════════════════════════
+
+
+class IntValue(Value):
+    @property
+    def val(self):
+        return self._resolve()
+
+    def _wrap(self, raw):
+        val = int(raw)
+        nbits = self._type.nbits
+        mask = (1 << nbits) - 1
+        val &= mask
+        if self._type.signed and val >= (1 << (nbits - 1)):
+            val -= (1 << nbits)
+        return self._make_detached(val)
+
+    def _make_detached(self, val):
+        ty = self._type
+        bo = self._provider.byteorder
+        byte_order = "little" if bo == ByteOrder.Little else "big"
+        if ty.signed and val < 0:
+            val = val + (1 << ty.nbits)
+        data = val.to_bytes(ty.nbytes, byte_order)
+        return IntValue(ty, BufferProvider(bytearray(data), bo), 0)
+
+    def __neg__(self):
+        return self._wrap(-self.val)
+
+    def __pos__(self):
+        return self._wrap(self.val)
+
+    def __invert__(self):
+        return self._wrap(~self.val)
+
+    def __abs__(self):
+        return self._wrap(abs(self.val))
+
+
+class FloatValue(Value):
+    @property
+    def val(self):
+        return self._resolve()
+
+    def _wrap(self, raw):
+        return self._make_detached(float(raw))
+
+    def _make_detached(self, val):
+        bo = self._provider.byteorder
+        fmt = "<f" if bo == ByteOrder.Little else ">f"
+        data = _struct.pack(fmt, val)
+        return FloatValue(self._type, BufferProvider(bytearray(data), bo), 0)
+
+    def __neg__(self):
+        return self._wrap(-self.val)
+
+    def __pos__(self):
+        return self._wrap(self.val)
+
+    def __abs__(self):
+        return self._wrap(abs(self.val))
+
+
+class DoubleValue(Value):
+    @property
+    def val(self):
+        return self._resolve()
+
+    def _wrap(self, raw):
+        return self._make_detached(float(raw))
+
+    def _make_detached(self, val):
+        bo = self._provider.byteorder
+        fmt = "<d" if bo == ByteOrder.Little else ">d"
+        data = _struct.pack(fmt, val)
+        return DoubleValue(self._type, BufferProvider(bytearray(data), bo), 0)
+
+    def __neg__(self):
+        return self._wrap(-self.val)
+
+    def __pos__(self):
+        return self._wrap(self.val)
+
+    def __abs__(self):
+        return self._wrap(abs(self.val))
+
+
+class EnumValue(Value):
+    @property
+    def val(self):
+        return self._resolve()
+
+    def _wrap(self, raw):
+        val = int(raw)
+        child = self._type.child
+        nbits = child.nbits
+        mask = (1 << nbits) - 1
+        val &= mask
+        if child.signed and val >= (1 << (nbits - 1)):
+            val -= (1 << nbits)
+        return self._make_detached(val)
+
+    def _make_detached(self, val):
+        child = self._type.child
+        bo = self._provider.byteorder
+        byte_order = "little" if bo == ByteOrder.Little else "big"
+        if child.signed and val < 0:
+            val = val + (1 << child.nbits)
+        data = val.to_bytes(child.nbytes, byte_order)
+        return EnumValue(self._type, BufferProvider(bytearray(data), bo), 0)
+
+    def __neg__(self):
+        return self._wrap(-self.val)
+
+    def __pos__(self):
+        return self._wrap(self.val)
+
+    def __invert__(self):
+        return self._wrap(~self.val)
+
+    def __abs__(self):
+        return self._wrap(abs(self.val))
+
+
+_install_ops(IntValue, _COMMON_OPS + _BITWISE_OPS)
+_install_ops(FloatValue, _COMMON_OPS)
+_install_ops(DoubleValue, _COMMON_OPS)
+_install_ops(EnumValue, _COMMON_OPS + _BITWISE_OPS)
+
+
+def _typed_value(ty, provider, offset, bit_offset=None):
+    if isinstance(ty, Enum):
+        return EnumValue(ty, provider, offset)
+    if isinstance(ty, Float):
+        return FloatValue(ty, provider, offset)
+    if isinstance(ty, Double):
+        return DoubleValue(ty, provider, offset)
+    iv = IntValue(ty, provider, offset)
+    if isinstance(ty, Bits) and bit_offset is not None:
+        object.__setattr__(iv, '_bit_offset', bit_offset)
+    return iv

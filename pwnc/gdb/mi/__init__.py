@@ -17,6 +17,7 @@ from .proxy import PROXY_CLASSES, BreakpointProxy, InferiorProxy, FrameProxy, Th
 from pwnc.types.provider import BytesProvider, ByteOrder
 from pwnc.types.primitives import Int, Float, Double, Ptr
 from pwnc.types.containers import Struct, Union, Array, Enum
+from pwnc.types.value import Value
 
 
 # --- Type descriptor → pwnc.types reconstruction ---
@@ -186,6 +187,33 @@ class GdbRemoteBytesProvider(BytesProvider):
         return self._base_addr
 
 
+# --- GDB-aware Value subclasses ---
+
+class GdbValue(Value):
+    def ref(self, bits=64):
+        return RefValue(Ptr(self._type, bits=bits), self._provider, self._base_offset, self.address)
+
+
+class RefValue(GdbValue):
+    def __init__(self, type, provider, base_offset, addr=None):
+        super().__init__(type, provider, base_offset)
+        if addr is not None:
+            object.__setattr__(self, '_ref_addr', addr)
+
+    def _resolve(self):
+        if isinstance(self._type, Ptr) and hasattr(self, '_ref_addr'):
+            return self._ref_addr
+        return super()._resolve()
+
+    def cast(self, target):
+        if isinstance(target, Value):
+            target = target._type
+        return RefValue(target, self._provider, self._base_offset, self._ref_addr)
+
+    def _ptr_result(self, addr):
+        return RefValue(self._type, self._provider, self._base_offset, addr)
+
+
 # --- Symbol accessor ---
 
 class SymbolAccessor:
@@ -222,7 +250,7 @@ class SymbolAccessor:
             ptype = Ptr(Int(8), bits=64)
 
         provider = GdbRemoteBytesProvider(self._conn, addr, self._byteorder)
-        return ptype.use(provider)
+        return GdbValue(ptype, provider, 0)
 
 
 # --- Registers ---
