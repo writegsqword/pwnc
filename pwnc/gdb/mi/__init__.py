@@ -21,10 +21,24 @@ from pwnc.types.containers import Struct, Union, Array, Enum
 
 # --- Type descriptor → pwnc.types reconstruction ---
 
-def pwnc_type_from_desc(desc):
-    """Reconstruct a pwnc.types.Type from a serializable dict descriptor."""
+def pwnc_type_from_desc(desc, _cache=None):
+    """Reconstruct a pwnc.types.Type from a serializable dict descriptor.
+
+    Handles cyclic descriptors (e.g. struct Node with a Node* field):
+    the bridge emits the same dict object for every occurrence of the
+    same struct, so pickle preserves identity.  We detect this via
+    ``id(desc)`` and return the in-progress Struct/Union, which will
+    be fully populated by the time the top-level call returns.
+    """
     if desc is None:
         return None
+    if _cache is None:
+        _cache = {}
+
+    desc_id = id(desc)
+    if desc_id in _cache:
+        return _cache[desc_id]
+
     kind = desc["kind"]
     if kind == "int":
         return Int(desc["bits"], signed=desc.get("signed", False))
@@ -33,21 +47,54 @@ def pwnc_type_from_desc(desc):
     if kind == "double":
         return Double()
     if kind == "ptr":
-        return Ptr(pwnc_type_from_desc(desc["child"]), bits=desc["bits"])
+        return Ptr(pwnc_type_from_desc(desc["child"], _cache), bits=desc["bits"])
     if kind == "array":
-        return Array(pwnc_type_from_desc(desc["child"]), desc["count"])
+        return Array(pwnc_type_from_desc(desc["child"], _cache), desc["count"])
     if kind == "struct":
-        fields = [(f["name"], pwnc_type_from_desc(f["type"])) for f in desc["fields"]]
-        return Struct(desc["name"], fields)
+        return _struct_from_desc(desc, _cache, Struct)
     if kind == "union":
-        fields = [(f["name"], pwnc_type_from_desc(f["type"])) for f in desc["fields"]]
-        return Union(desc["name"], fields)
+        return _struct_from_desc(desc, _cache, Union)
     if kind == "enum":
-        return Enum(pwnc_type_from_desc(desc["child"]),
+        return Enum(pwnc_type_from_desc(desc["child"], _cache),
                     desc["members"], name=desc.get("name"))
     if kind == "void":
         return None
     return Int(desc.get("bits", 8), signed=False)
+
+
+def _struct_from_desc(desc, _cache, cls):
+    """Build a Struct or Union from a descriptor, handling self-references.
+
+    The object is allocated and cached *before* its fields are resolved
+    so that cyclic pointer children find the already-existing object.
+    Uses ``_from_layout``-style initialisation to preserve the exact
+    field offsets reported by GDB (respecting alignment padding).
+    """
+    from pwnc.types.base import Type as TypeBase
+
+    obj = object.__new__(cls)
+    _cache[id(desc)] = obj          # cache before recursing into fields
+
+    name = desc["name"]
+    size = desc.get("size", 0)
+
+    layout = []
+    for f in desc["fields"]:
+        ftype = pwnc_type_from_desc(f["type"], _cache)
+        fname = f["name"]
+        byte_off = f.get("offset", 0)
+        bit_off = f.get("bit_offset", 0)
+        layout.append((fname, ftype, byte_off, byte_off * 8 + bit_off))
+
+    obj.name = name
+    obj.mode = "packed"
+    obj._fields = [(l[0], l[1]) for l in layout]
+    obj._layout = layout
+    obj._padding = []
+    obj._field_map = {l[0]: i for i, l in enumerate(layout)}
+    TypeBase.__init__(obj, size * 8)
+
+    return obj
 
 
 # --- MI-based bridge connection ---

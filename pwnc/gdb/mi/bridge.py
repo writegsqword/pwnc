@@ -202,14 +202,17 @@ def resolve_type(name):
     return None
 
 
-def gdb_type_to_pwnc(gdb_type, _visiting=None):
+def gdb_type_to_pwnc(gdb_type, _cache=None):
     """Convert a gdb.Type to a serializable dict describing a pwnc.types.Type.
 
-    _visiting tracks struct/union tags currently being converted to
-    break cycles from self-referential pointers (e.g. struct Node *next).
+    _cache maps struct/union tags to their (possibly incomplete) result
+    dicts.  When a pointer target is a struct already in _cache, the
+    cached dict is reused — creating a circular reference that pickle
+    serialises natively.  By the time the top-level call returns every
+    cached dict is fully populated.
     """
-    if _visiting is None:
-        _visiting = set()
+    if _cache is None:
+        _cache = {}
 
     t = gdb_type.strip_typedefs()
     code = t.code
@@ -226,38 +229,31 @@ def gdb_type_to_pwnc(gdb_type, _visiting=None):
         else:
             return {"kind": "double"}
     elif code == gdb.TYPE_CODE_PTR:
-        target = t.target().strip_typedefs()
-        # If the pointer target is a struct/union we're already visiting,
-        # emit a void pointer to break the cycle.
-        if target.code in (gdb.TYPE_CODE_STRUCT, gdb.TYPE_CODE_UNION):
-            tag = target.tag or target.name
-            if tag and tag in _visiting:
-                return {"kind": "ptr", "child": {"kind": "void"}, "bits": t.sizeof * 8}
-        return {"kind": "ptr", "child": gdb_type_to_pwnc(t.target(), _visiting), "bits": t.sizeof * 8}
+        return {"kind": "ptr", "child": gdb_type_to_pwnc(t.target(), _cache), "bits": t.sizeof * 8}
     elif code == gdb.TYPE_CODE_ARRAY:
         target = t.target()
         low, high = t.range()
         count = high - low + 1
-        return {"kind": "array", "child": gdb_type_to_pwnc(target, _visiting), "count": count}
+        return {"kind": "array", "child": gdb_type_to_pwnc(target, _cache), "count": count}
     elif code in (gdb.TYPE_CODE_STRUCT, gdb.TYPE_CODE_UNION):
         tag = t.tag or t.name or "<anon>"
-        _visiting.add(tag)
-        fields = []
+        if tag in _cache:
+            return _cache[tag]
+        kind = "struct" if code == gdb.TYPE_CODE_STRUCT else "union"
+        result = {"kind": kind, "name": tag, "fields": [], "size": t.sizeof}
+        _cache[tag] = result          # cache BEFORE processing fields
         for f in t.fields():
-            fields.append({
+            result["fields"].append({
                 "name": f.name,
-                "type": gdb_type_to_pwnc(f.type, _visiting),
+                "type": gdb_type_to_pwnc(f.type, _cache),
                 "offset": f.bitpos // 8,
                 "bit_offset": f.bitpos % 8,
             })
-        _visiting.discard(tag)
-        kind = "struct" if code == gdb.TYPE_CODE_STRUCT else "union"
-        return {"kind": kind, "name": tag,
-                "fields": fields, "size": t.sizeof}
+        return result
     elif code == gdb.TYPE_CODE_ENUM:
         members = {f.name: f.enumval for f in t.fields()}
         try:
-            child_desc = gdb_type_to_pwnc(t.target(), _visiting)
+            child_desc = gdb_type_to_pwnc(t.target(), _cache)
         except Exception:
             child_desc = {"kind": "int", "bits": t.sizeof * 8, "signed": False}
         return {"kind": "enum", "child": child_desc,
