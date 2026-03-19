@@ -249,13 +249,16 @@ class Gdb:
     """GDB controller with MI3 interface, bridge RPC, and typed access."""
 
     def __init__(self, gdb_path="gdb", env=None):
+        import atexit
         self.process = GdbProcess(gdb_path=gdb_path, env=env)
         self.conn: BridgeConnection | None = None
         self.sym: SymbolAccessor | None = None
         self.reg: Registers | None = None
         self.target = None  # pwntools process (set by debug())
         self._console_proc = None  # kitty subprocess for console UI
+        self._closed = False
         self._bp_callbacks: dict[int, callable] = {}
+        atexit.register(self.close)
 
     def _start_console(self):
         """Spawn a kitty terminal and attach GDB's console UI to it."""
@@ -399,6 +402,9 @@ class Gdb:
     # --- Lifecycle ---
 
     def close(self):
+        if self._closed:
+            return
+        self._closed = True
         self.process.close()
         if self.target is not None:
             self.target.close()
