@@ -202,8 +202,15 @@ def resolve_type(name):
     return None
 
 
-def gdb_type_to_pwnc(gdb_type):
-    """Convert a gdb.Type to a serializable dict describing a pwnc.types.Type."""
+def gdb_type_to_pwnc(gdb_type, _visiting=None):
+    """Convert a gdb.Type to a serializable dict describing a pwnc.types.Type.
+
+    _visiting tracks struct/union tags currently being converted to
+    break cycles from self-referential pointers (e.g. struct Node *next).
+    """
+    if _visiting is None:
+        _visiting = set()
+
     t = gdb_type.strip_typedefs()
     code = t.code
 
@@ -219,28 +226,38 @@ def gdb_type_to_pwnc(gdb_type):
         else:
             return {"kind": "double"}
     elif code == gdb.TYPE_CODE_PTR:
-        return {"kind": "ptr", "child": gdb_type_to_pwnc(t.target()), "bits": t.sizeof * 8}
+        target = t.target().strip_typedefs()
+        # If the pointer target is a struct/union we're already visiting,
+        # emit a void pointer to break the cycle.
+        if target.code in (gdb.TYPE_CODE_STRUCT, gdb.TYPE_CODE_UNION):
+            tag = target.tag or target.name
+            if tag and tag in _visiting:
+                return {"kind": "ptr", "child": {"kind": "void"}, "bits": t.sizeof * 8}
+        return {"kind": "ptr", "child": gdb_type_to_pwnc(t.target(), _visiting), "bits": t.sizeof * 8}
     elif code == gdb.TYPE_CODE_ARRAY:
         target = t.target()
         low, high = t.range()
         count = high - low + 1
-        return {"kind": "array", "child": gdb_type_to_pwnc(target), "count": count}
+        return {"kind": "array", "child": gdb_type_to_pwnc(target, _visiting), "count": count}
     elif code in (gdb.TYPE_CODE_STRUCT, gdb.TYPE_CODE_UNION):
+        tag = t.tag or t.name or "<anon>"
+        _visiting.add(tag)
         fields = []
         for f in t.fields():
             fields.append({
                 "name": f.name,
-                "type": gdb_type_to_pwnc(f.type),
+                "type": gdb_type_to_pwnc(f.type, _visiting),
                 "offset": f.bitpos // 8,
                 "bit_offset": f.bitpos % 8,
             })
+        _visiting.discard(tag)
         kind = "struct" if code == gdb.TYPE_CODE_STRUCT else "union"
-        return {"kind": kind, "name": t.tag or t.name or "<anon>",
+        return {"kind": kind, "name": tag,
                 "fields": fields, "size": t.sizeof}
     elif code == gdb.TYPE_CODE_ENUM:
         members = {f.name: f.enumval for f in t.fields()}
         try:
-            child_desc = gdb_type_to_pwnc(t.target())
+            child_desc = gdb_type_to_pwnc(t.target(), _visiting)
         except Exception:
             child_desc = {"kind": "int", "bits": t.sizeof * 8, "signed": False}
         return {"kind": "enum", "child": child_desc,
