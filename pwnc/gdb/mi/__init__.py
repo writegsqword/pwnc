@@ -260,12 +260,20 @@ class Gdb:
     def _start_console(self):
         """Spawn a kitty terminal and attach GDB's console UI to it."""
         import subprocess as _sp
+        import tempfile
+
+        fifo = os.path.join(tempfile.mkdtemp(), "tty")
+        os.mkfifo(fifo)
 
         self._console_proc = _sp.Popen(
-            ["kitty", "--hold", "-e", "sh", "-c", "tty; exec sleep infinity"],
-            stdout=_sp.PIPE,
+            ["kitty", "-e", "sh", "-c", f"tty > {fifo}; exec sleep infinity"],
         )
-        tty_path = self._console_proc.stdout.readline().decode().strip()
+
+        with open(fifo) as f:
+            tty_path = f.readline().strip()
+        os.unlink(fifo)
+        os.rmdir(os.path.dirname(fifo))
+
         self.process.console(f"new-ui console {tty_path}")
 
     def _start_bridge(self):
