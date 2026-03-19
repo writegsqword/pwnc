@@ -48,7 +48,7 @@ class Double(Type):
 
 
 class Ptr(Type):
-    def __init__(self, child, bits=64):
+    def __init__(self, child = None, bits=64):
         super().__init__(bits)
         self.child = child
 

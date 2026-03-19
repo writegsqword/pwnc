@@ -5,9 +5,17 @@ from .containers import Struct, Union, Array, Enum
 
 class Value:
     def __init__(self, type, provider, base_offset):
-        self._type = type
-        self._provider = provider
-        self._base_offset = base_offset
+        object.__setattr__(self, "_type", type)
+        object.__setattr__(self, "_provider", provider)
+        object.__setattr__(self, "_base_offset", base_offset)
+
+    @property
+    def type(self):
+        return self._type
+    
+    @type.setter
+    def type(self, value):
+        self._type = value
 
     @property
     def offset(self):
@@ -85,6 +93,10 @@ class Value:
     def _write(self, ty, offset, value):
         """Write a Python value to the provider at the given offset."""
 
+        if isinstance(value, Value):
+            if isinstance(value._type, (Int, Enum, Ptr)):
+                value = value._resolve()
+
         if isinstance(ty, Enum):
             ty = ty.child
 
@@ -112,10 +124,6 @@ class Value:
             raise TypeError(f"cannot write to field of type {type(ty).__name__}")
 
     def __setattr__(self, name, value):
-        if name.startswith("_"):
-            object.__setattr__(self, name, value)
-            return
-
         ty = self._type
         if not isinstance(ty, (Struct, Union)):
             raise AttributeError(f"cannot set fields on {type(ty).__name__} value")
@@ -139,9 +147,6 @@ class Value:
             )
 
     def __getattr__(self, name):
-        if name.startswith("__"):
-            raise AttributeError(name)
-
         ty = self._type
 
         if isinstance(ty, (Struct, Union)):
