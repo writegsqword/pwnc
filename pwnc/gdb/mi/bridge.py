@@ -164,20 +164,42 @@ def resolve_type(name):
         except Exception:
             pass
 
-    if sym is None:
-        return None
+    if sym is not None:
+        try:
+            addr = int(sym.value().address)
+        except Exception:
+            addr = None
+        try:
+            desc = gdb_type_to_pwnc(sym.type)
+        except Exception:
+            desc = None
+        return (desc, addr)
 
+    # Fallback: use GDB's expression evaluator, which searches minsyms,
+    # PLT entries, and shared-library symbols that lookup_*symbol misses.
     try:
-        addr = int(sym.value().address)
-    except Exception:
-        addr = None
+        val = gdb.parse_and_eval(name)
+        t = val.type.strip_typedefs()
 
-    try:
-        desc = gdb_type_to_pwnc(sym.type)
-    except Exception:
-        desc = None
+        # For symbols without debug info or function types, get address via &name.
+        # Return "function" flag so the client returns the address directly
+        # rather than reading memory at the address.
+        if t.code in (gdb.TYPE_CODE_ERROR, gdb.TYPE_CODE_FUNC):
+            addr_val = gdb.parse_and_eval(f"&{name}")
+            addr = int(addr_val)
+            return (None, addr, "function")
 
-    return (desc, addr)
+        # Regular value (variable in a shared library)
+        addr = int(val.address) if val.address else int(val)
+        try:
+            desc = gdb_type_to_pwnc(t)
+        except Exception:
+            desc = None
+        return (desc, addr)
+    except Exception:
+        pass
+
+    return None
 
 
 def gdb_type_to_pwnc(gdb_type):

@@ -146,6 +146,15 @@ class SymbolAccessor:
         if result is None:
             raise AttributeError(f"Symbol '{name}' not found")
 
+        # Functions / no-debug-info symbols return (desc, addr, "function").
+        # The address IS the value — return a pointer directly.
+        if len(result) == 3 and result[2] == "function":
+            _, addr, _ = result
+            from pwnc.types.provider import BufferProvider
+            ptype = Ptr(None, bits=64)
+            buf = addr.to_bytes(8, 'little' if self._byteorder == ByteOrder.Little else 'big')
+            return ptype.use(BufferProvider(buf, self._byteorder))
+
         desc, addr = result
         if addr is None:
             raise AttributeError(f"Symbol '{name}' has no address")
@@ -319,9 +328,19 @@ class Gdb:
 
 # --- Convenience constructors ---
 
-def debug(program, *args, gdb_path="gdb", env=None, **kwargs) -> Gdb:
+def debug(program, *args, gdb_path="gdb", gdb_args=None, env=None) -> Gdb:
+    """Spawn GDB on a program, start the bridge, and return a Gdb instance.
+
+    Args:
+        program: Path to the executable.
+        *args: Arguments passed to the program (not GDB).
+        gdb_path: Path to the gdb binary.
+        gdb_args: Extra command-line arguments for GDB itself
+                  (e.g. ["-ex", "set disable-randomization off"]).
+        env: Environment dict for the GDB subprocess.
+    """
     g = Gdb(gdb_path=gdb_path, env=env)
-    extra = []
+    extra = list(gdb_args) if gdb_args else []
     if args:
         extra.append("--args")
         extra.extend(str(a) for a in args)
@@ -330,11 +349,20 @@ def debug(program, *args, gdb_path="gdb", env=None, **kwargs) -> Gdb:
     return g
 
 
-def attach(pid_or_name, gdb_path="gdb", env=None, **kwargs) -> Gdb:
+def attach(pid_or_name, gdb_path="gdb", gdb_args=None, env=None) -> Gdb:
+    """Attach GDB to a running process (by PID or name).
+
+    Args:
+        pid_or_name: Process ID (int) or process name (str).
+        gdb_path: Path to the gdb binary.
+        gdb_args: Extra command-line arguments for GDB itself.
+        env: Environment dict for the GDB subprocess.
+    """
     g = Gdb(gdb_path=gdb_path, env=env)
+    extra = list(gdb_args) if gdb_args else None
 
     if isinstance(pid_or_name, int):
-        g.process.start(pid=pid_or_name)
+        g.process.start(pid=pid_or_name, extra_args=extra)
     else:
         import shutil
         pidof = shutil.which("pidof")
@@ -344,7 +372,7 @@ def attach(pid_or_name, gdb_path="gdb", env=None, **kwargs) -> Gdb:
                                     capture_output=True, text=True)
             if result.returncode == 0:
                 pid = int(result.stdout.strip().split()[0])
-                g.process.start(pid=pid)
+                g.process.start(pid=pid, extra_args=extra)
             else:
                 raise RuntimeError(f"Process '{pid_or_name}' not found")
         else:
