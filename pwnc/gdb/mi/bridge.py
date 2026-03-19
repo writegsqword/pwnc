@@ -276,6 +276,12 @@ def get_endian():
     return "big"
 
 
+@handler("get_pointer_size")
+def get_pointer_size():
+    void_ptr = gdb.lookup_type("void").pointer()
+    return void_ptr.sizeof * 8
+
+
 # --- Dispatch entry point ---
 # Called via MI: -interpreter-exec console "python _pwnc_dispatch('...')"
 # Payload is a base64-encoded pickle of (method, args, kwargs).
