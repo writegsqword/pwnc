@@ -56,6 +56,16 @@ class Value:
             target = target._type
         return type(self)(target, self._provider, self._base_offset)
 
+    def ref(self):
+        ptrbits = self._provider.ptrbits
+        ptr_type = Ptr(self._type, bits=ptrbits)
+        addr = self.address
+        bo = self._provider.byteorder
+        byte_order = "little" if bo == ByteOrder.Little else "big"
+        data = addr.to_bytes(ptrbits // 8, byte_order)
+        buf = BufferProvider(bytearray(data), bo, ptrbits)
+        return RefValue(ptr_type, buf, 0, self._provider, addr)
+
     def _resolve(self):
         """Resolve this value to a Python object (int, float, etc.)."""
 
@@ -495,6 +505,57 @@ class ArrayValue(Value):
         if ty.count > max_show:
             return "[" + ", ".join(items[:-1]) + ", ...]"
         return "[" + ", ".join(items) + "]"
+
+
+class RefValue(Value):
+    def __init__(self, type, provider, base_offset, orig_provider, addr=None):
+        super().__init__(type, provider, base_offset)
+        object.__setattr__(self, '_orig_provider', orig_provider)
+        if addr is not None:
+            object.__setattr__(self, '_ref_addr', addr)
+
+    def _resolve(self):
+        if isinstance(self._type, Ptr) and hasattr(self, '_ref_addr'):
+            return self._ref_addr
+        return super()._resolve()
+
+    def cast(self, target):
+        if isinstance(target, Value):
+            target = target._type
+        return RefValue(target, self._provider, self._base_offset,
+                        self._orig_provider, self._ref_addr)
+
+    def _ptr_result(self, addr):
+        return RefValue(self._type, self._provider, self._base_offset,
+                        self._orig_provider, addr)
+
+    def __getitem__(self, index):
+        if isinstance(self._type, Ptr):
+            if self._type.child is None:
+                raise TypeError("cannot dereference void pointer")
+            addr = self._resolve()
+            child = self._type.child
+            target_addr = addr + index * child.nbytes
+            new_provider = self._orig_provider.rebase(target_addr)
+            if isinstance(child, (Int, Float, Double, Enum)):
+                return _typed_value(child, new_provider, 0)
+            if isinstance(child, Array):
+                return ArrayValue(child, new_provider, 0)
+            return Value(child, new_provider, 0)
+        return super().__getitem__(index)
+
+    def __setitem__(self, index, value):
+        if isinstance(self._type, Ptr):
+            if self._type.child is None:
+                raise TypeError("cannot dereference void pointer")
+            addr = self._resolve()
+            child = self._type.child
+            target_addr = addr + index * child.nbytes
+            new_provider = self._orig_provider.rebase(target_addr)
+            child_val = Value(child, new_provider, 0)
+            child_val._write(child, 0, value)
+            return
+        super().__setitem__(index, value)
 
 
 # ══════════════════════════════════════════════════════════════════

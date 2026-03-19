@@ -8,6 +8,7 @@ class ByteOrder:
 
 class BytesProvider(ABC):
     byteorder: int
+    ptrbits: int = 64
 
     @abstractmethod
     def read(self, offset: int, size: int) -> bytes: ...
@@ -24,7 +25,7 @@ class BytesProvider(ABC):
 
 
 class BufferProvider(BytesProvider):
-    def __init__(self, data, byteorder=ByteOrder.Little):
+    def __init__(self, data, byteorder=ByteOrder.Little, ptrbits=64):
         if isinstance(data, memoryview):
             self._data = data
         elif isinstance(data, bytearray):
@@ -32,6 +33,7 @@ class BufferProvider(BytesProvider):
         else:
             self._data = memoryview(bytearray(data))
         self.byteorder = byteorder
+        self.ptrbits = ptrbits
 
     def read(self, offset: int, size: int) -> bytes:
         return bytes(self._data[offset : offset + size])

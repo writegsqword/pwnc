@@ -166,10 +166,11 @@ class _ProxyUnpickler(pickle.Unpickler):
 class GdbRemoteBytesProvider(BytesProvider):
     """BytesProvider that reads/writes memory via GDB bridge RPC."""
 
-    def __init__(self, conn, base_addr, byteorder):
+    def __init__(self, conn, base_addr, byteorder, ptrbits=64):
         self._conn = conn
         self._base_addr = base_addr
         self.byteorder = byteorder
+        self.ptrbits = ptrbits
 
     def read(self, offset, size):
         return bytes(self._conn.call("read_memory",
@@ -180,38 +181,11 @@ class GdbRemoteBytesProvider(BytesProvider):
                         self._base_addr + offset, bytes(data))
 
     def rebase(self, addr):
-        return GdbRemoteBytesProvider(self._conn, addr, self.byteorder)
+        return GdbRemoteBytesProvider(self._conn, addr, self.byteorder, self.ptrbits)
 
     @property
     def address(self):
         return self._base_addr
-
-
-# --- GDB-aware Value subclasses ---
-
-class GdbValue(Value):
-    def ref(self, bits=64):
-        return RefValue(Ptr(self._type, bits=bits), self._provider, self._base_offset, self.address)
-
-
-class RefValue(GdbValue):
-    def __init__(self, type, provider, base_offset, addr=None):
-        super().__init__(type, provider, base_offset)
-        if addr is not None:
-            object.__setattr__(self, '_ref_addr', addr)
-
-    def _resolve(self):
-        if isinstance(self._type, Ptr) and hasattr(self, '_ref_addr'):
-            return self._ref_addr
-        return super()._resolve()
-
-    def cast(self, target):
-        if isinstance(target, Value):
-            target = target._type
-        return RefValue(target, self._provider, self._base_offset, self._ref_addr)
-
-    def _ptr_result(self, addr):
-        return RefValue(self._type, self._provider, self._base_offset, addr)
 
 
 # --- Symbol accessor ---
@@ -219,9 +193,10 @@ class RefValue(GdbValue):
 class SymbolAccessor:
     """Attribute-style symbol lookup: gdb.sym.main → typed Value."""
 
-    def __init__(self, conn, byteorder):
+    def __init__(self, conn, byteorder, ptrbits=64):
         object.__setattr__(self, '_conn', conn)
         object.__setattr__(self, '_byteorder', byteorder)
+        object.__setattr__(self, '_ptrbits', ptrbits)
 
     def __getattr__(self, name):
         result = self._conn.call("resolve_type", name)
@@ -233,9 +208,9 @@ class SymbolAccessor:
         if len(result) == 3 and result[2] == "function":
             _, addr, _ = result
             from pwnc.types.provider import BufferProvider
-            ptype = Ptr(None, bits=64)
-            buf = addr.to_bytes(8, 'little' if self._byteorder == ByteOrder.Little else 'big')
-            return ptype.use(BufferProvider(buf, self._byteorder))
+            ptype = Ptr(None, bits=self._ptrbits)
+            buf = addr.to_bytes(self._ptrbits // 8, 'little' if self._byteorder == ByteOrder.Little else 'big')
+            return ptype.use(BufferProvider(buf, self._byteorder, self._ptrbits))
 
         desc, addr = result
         if addr is None:
@@ -244,13 +219,13 @@ class SymbolAccessor:
         if desc is not None:
             ptype = pwnc_type_from_desc(desc)
         else:
-            ptype = Ptr(Int(8), bits=64)
+            ptype = Ptr(Int(8), bits=self._ptrbits)
 
         if ptype is None:
-            ptype = Ptr(Int(8), bits=64)
+            ptype = Ptr(Int(8), bits=self._ptrbits)
 
-        provider = GdbRemoteBytesProvider(self._conn, addr, self._byteorder)
-        return GdbValue(ptype, provider, 0)
+        provider = GdbRemoteBytesProvider(self._conn, addr, self._byteorder, self._ptrbits)
+        return Value(ptype, provider, 0)
 
 
 # --- Registers ---
@@ -295,11 +270,12 @@ class Gdb:
 
         self.conn = BridgeConnection(self.process, proxy_classes=PROXY_CLASSES)
 
-        # detect byte order
+        # detect byte order and pointer size
         endian = self.conn.call("get_endian")
         bo = ByteOrder.Little if endian == "little" else ByteOrder.Big
+        ptrbits = self.conn.call("get_pointer_size")
 
-        self.sym = SymbolAccessor(self.conn, bo)
+        self.sym = SymbolAccessor(self.conn, bo, ptrbits)
         self.reg = Registers(self.conn)
 
     # --- Execution control ---
