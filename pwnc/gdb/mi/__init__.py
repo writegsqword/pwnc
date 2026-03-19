@@ -181,6 +181,10 @@ class GdbRemoteBytesProvider(BytesProvider):
     def rebase(self, addr):
         return GdbRemoteBytesProvider(self._conn, addr, self.byteorder)
 
+    @property
+    def address(self):
+        return self._base_addr
+
 
 # --- Symbol accessor ---
 

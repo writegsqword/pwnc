@@ -18,6 +18,10 @@ class BytesProvider(ABC):
     def rebase(self, addr: int) -> 'BytesProvider':
         raise NotImplementedError
 
+    @property
+    def address(self) -> int:
+        raise TypeError("provider has no memory address")
+
 
 class BufferProvider(BytesProvider):
     def __init__(self, data, byteorder=ByteOrder.Little):

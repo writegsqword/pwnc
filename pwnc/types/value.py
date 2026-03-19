@@ -18,6 +18,21 @@ class Value:
         self._type = value
 
     @property
+    def address(self):
+        return self._provider.address + self._base_offset
+
+    def ref(self, bits=64):
+        try:
+            addr = self.address
+        except TypeError:
+            raise TypeError("ref() requires a remote-backed value (no address available for local buffers)")
+        ptr_type = Ptr(self._type, bits=bits)
+        bo = self._provider.byteorder
+        byte_order = "little" if bo == ByteOrder.Little else "big"
+        buf = addr.to_bytes(ptr_type.nbytes, byte_order)
+        return Value(ptr_type, BufferProvider(bytearray(buf), bo), 0)
+
+    @property
     def offset(self):
         return self._base_offset
 
@@ -136,7 +151,7 @@ class Value:
 
         if isinstance(field_type, Bits):
             child_val = Value(field_type, self._provider, field_offset)
-            child_val._bit_offset = bf.bit_offset if bf.bit_offset is not None else 0
+            object.__setattr__(child_val, '_bit_offset', bf.bit_offset if bf.bit_offset is not None else 0)
             child_val._write(field_type, field_offset, value)
         elif isinstance(field_type, (Int, Float, Double, Ptr, Enum)):
             self._write(field_type, field_offset, value)
@@ -156,7 +171,7 @@ class Value:
 
             # for Bits fields, attach bit_offset
             if isinstance(bf._type, Bits) and bf.bit_offset is not None:
-                child_val._bit_offset = bf.bit_offset
+                object.__setattr__(child_val, '_bit_offset', bf.bit_offset)
 
             # if child is a primitive, resolve immediately
             if isinstance(bf._type, (Int, Float, Double, Enum)):
@@ -237,6 +252,223 @@ class Value:
 
     def __float__(self):
         return float(self._resolve())
+
+    # --- Arithmetic helpers ---
+
+    def _to_python(self):
+        val = self._resolve()
+        if val is self:
+            raise TypeError(f"cannot perform arithmetic on {type(self._type).__name__} value")
+        return val
+
+    @staticmethod
+    def _other_val(other):
+        if isinstance(other, Value):
+            return other._to_python()
+        return other
+
+    def _ptr_result(self, addr):
+        new_provider = self._provider.rebase(addr)
+        return Value(self._type, new_provider, 0)
+
+    # --- Arithmetic operators ---
+
+    def __add__(self, other):
+        if isinstance(self._type, Ptr):
+            n = self._other_val(other)
+            child = self._type.child
+            if child is None:
+                return self._ptr_result(self._resolve() + n)
+            return self._ptr_result(self._resolve() + n * child.nbytes)
+        return self._to_python() + self._other_val(other)
+
+    def __radd__(self, other):
+        if isinstance(self._type, Ptr):
+            child = self._type.child
+            if child is None:
+                return self._ptr_result(other + self._resolve())
+            return self._ptr_result(other * child.nbytes + self._resolve())
+        return other + self._to_python()
+
+    def __sub__(self, other):
+        if isinstance(self._type, Ptr):
+            if isinstance(other, Value) and isinstance(other._type, Ptr):
+                child = self._type.child
+                if child is None or child.nbytes == 0:
+                    return self._resolve() - other._resolve()
+                return (self._resolve() - other._resolve()) // child.nbytes
+            n = self._other_val(other)
+            child = self._type.child
+            if child is None:
+                return self._ptr_result(self._resolve() - n)
+            return self._ptr_result(self._resolve() - n * child.nbytes)
+        return self._to_python() - self._other_val(other)
+
+    def __rsub__(self, other):
+        if isinstance(self._type, Ptr):
+            return self._ptr_result(other - self._resolve())
+        return other - self._to_python()
+
+    def __mul__(self, other):
+        if isinstance(self._type, Ptr):
+            return self._ptr_result(self._resolve() * self._other_val(other))
+        return self._to_python() * self._other_val(other)
+
+    def __rmul__(self, other):
+        if isinstance(self._type, Ptr):
+            return self._ptr_result(other * self._resolve())
+        return other * self._to_python()
+
+    def __truediv__(self, other):
+        if isinstance(self._type, Ptr):
+            return self._ptr_result(int(self._resolve() / self._other_val(other)))
+        return self._to_python() / self._other_val(other)
+
+    def __rtruediv__(self, other):
+        if isinstance(self._type, Ptr):
+            return self._ptr_result(int(other / self._resolve()))
+        return other / self._to_python()
+
+    def __floordiv__(self, other):
+        if isinstance(self._type, Ptr):
+            return self._ptr_result(self._resolve() // self._other_val(other))
+        return self._to_python() // self._other_val(other)
+
+    def __rfloordiv__(self, other):
+        if isinstance(self._type, Ptr):
+            return self._ptr_result(other // self._resolve())
+        return other // self._to_python()
+
+    def __mod__(self, other):
+        if isinstance(self._type, Ptr):
+            return self._ptr_result(self._resolve() % self._other_val(other))
+        return self._to_python() % self._other_val(other)
+
+    def __rmod__(self, other):
+        if isinstance(self._type, Ptr):
+            return self._ptr_result(other % self._resolve())
+        return other % self._to_python()
+
+    def __pow__(self, other):
+        if isinstance(self._type, Ptr):
+            return self._ptr_result(self._resolve() ** self._other_val(other))
+        return self._to_python() ** self._other_val(other)
+
+    def __rpow__(self, other):
+        if isinstance(self._type, Ptr):
+            return self._ptr_result(other ** self._resolve())
+        return other ** self._to_python()
+
+    # --- Bitwise operators ---
+
+    def __and__(self, other):
+        if isinstance(self._type, Ptr):
+            return self._ptr_result(self._resolve() & self._other_val(other))
+        return self._to_python() & self._other_val(other)
+
+    def __rand__(self, other):
+        if isinstance(self._type, Ptr):
+            return self._ptr_result(other & self._resolve())
+        return other & self._to_python()
+
+    def __or__(self, other):
+        if isinstance(self._type, Ptr):
+            return self._ptr_result(self._resolve() | self._other_val(other))
+        return self._to_python() | self._other_val(other)
+
+    def __ror__(self, other):
+        if isinstance(self._type, Ptr):
+            return self._ptr_result(other | self._resolve())
+        return other | self._to_python()
+
+    def __xor__(self, other):
+        if isinstance(self._type, Ptr):
+            return self._ptr_result(self._resolve() ^ self._other_val(other))
+        return self._to_python() ^ self._other_val(other)
+
+    def __rxor__(self, other):
+        if isinstance(self._type, Ptr):
+            return self._ptr_result(other ^ self._resolve())
+        return other ^ self._to_python()
+
+    def __lshift__(self, other):
+        if isinstance(self._type, Ptr):
+            return self._ptr_result(self._resolve() << self._other_val(other))
+        return self._to_python() << self._other_val(other)
+
+    def __rlshift__(self, other):
+        if isinstance(self._type, Ptr):
+            return self._ptr_result(other << self._resolve())
+        return other << self._to_python()
+
+    def __rshift__(self, other):
+        if isinstance(self._type, Ptr):
+            return self._ptr_result(self._resolve() >> self._other_val(other))
+        return self._to_python() >> self._other_val(other)
+
+    def __rrshift__(self, other):
+        if isinstance(self._type, Ptr):
+            return self._ptr_result(other >> self._resolve())
+        return other >> self._to_python()
+
+    # --- Unary operators ---
+
+    def __neg__(self):
+        if isinstance(self._type, Ptr):
+            return self._ptr_result(-self._resolve())
+        return -self._to_python()
+
+    def __pos__(self):
+        if isinstance(self._type, Ptr):
+            return self._ptr_result(self._resolve())
+        return +self._to_python()
+
+    def __invert__(self):
+        if isinstance(self._type, Ptr):
+            mask = (1 << self._type.nbits) - 1
+            return self._ptr_result(self._resolve() ^ mask)
+        return ~self._to_python()
+
+    # --- Comparison operators ---
+
+    def __eq__(self, other):
+        try:
+            return self._to_python() == self._other_val(other)
+        except TypeError:
+            return NotImplemented
+
+    def __ne__(self, other):
+        try:
+            return self._to_python() != self._other_val(other)
+        except TypeError:
+            return NotImplemented
+
+    def __lt__(self, other):
+        try:
+            return self._to_python() < self._other_val(other)
+        except TypeError:
+            return NotImplemented
+
+    def __le__(self, other):
+        try:
+            return self._to_python() <= self._other_val(other)
+        except TypeError:
+            return NotImplemented
+
+    def __gt__(self, other):
+        try:
+            return self._to_python() > self._other_val(other)
+        except TypeError:
+            return NotImplemented
+
+    def __ge__(self, other):
+        try:
+            return self._to_python() >= self._other_val(other)
+        except TypeError:
+            return NotImplemented
+
+    def __bool__(self):
+        return bool(self._to_python())
 
 
 class ArrayValue(Value):
