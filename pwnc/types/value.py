@@ -154,10 +154,7 @@ class Value:
                 child_val._bit_offset = bf.bit_offset
 
             # if child is a primitive, resolve immediately
-            if isinstance(bf._type, (Int, Float, Double, Ptr)):
-                return child_val._resolve()
-
-            if isinstance(bf._type, Enum):
+            if isinstance(bf._type, (Int, Float, Double, Enum)):
                 return child_val._resolve()
 
             # if child is Array, return a ArrayValue
@@ -178,7 +175,7 @@ class Value:
             target_addr = addr + index * child.nbytes
             new_provider = self._provider.rebase(target_addr)
             child_val = Value(child, new_provider, 0)
-            if isinstance(child, (Int, Float, Double, Ptr, Enum)):
+            if isinstance(child, (Int, Float, Double, Enum)):
                 return child_val._resolve()
             if isinstance(child, Array):
                 return ArrayValue(child, new_provider, 0)
@@ -246,7 +243,7 @@ class ArrayValue(Value):
         elem_offset = self._base_offset + index * child.nbytes
         elem_val = Value(child, self._provider, elem_offset)
 
-        if isinstance(child, (Int, Float, Double, Ptr, Enum)):
+        if isinstance(child, (Int, Float, Double, Enum)):
             return elem_val._resolve()
 
         return elem_val
