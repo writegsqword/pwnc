@@ -253,7 +253,37 @@ class Gdb:
         self.conn: BridgeConnection | None = None
         self.sym: SymbolAccessor | None = None
         self.reg: Registers | None = None
+        self.target = None  # pwntools process (set by debug())
+        self._console_kid = None  # kitty window id for console UI
         self._bp_callbacks: dict[int, callable] = {}
+
+    def _start_console(self):
+        """Spawn a kitty window and attach GDB's console UI to it."""
+        import json
+        import subprocess as _sp
+
+        kid = _sp.check_output(
+            ["kitten", "@", "launch", "--keep-focus", "--cwd=current"],
+            text=True,
+        ).strip()
+
+        # Find the window's shell PID to get its TTY
+        windows = json.loads(_sp.check_output(["kitten", "@", "ls"], text=True))
+        pid = None
+        for os_window in windows:
+            for tab in os_window["tabs"]:
+                for w in tab["windows"]:
+                    if str(w["id"]) == kid:
+                        pid = w["pid"]
+                        break
+
+        tty = _sp.check_output(
+            ["ps", "-p", str(pid), "-o", "tty="], text=True,
+        ).strip()
+        tty_path = f"/dev/{tty}"
+
+        self.process.console(f"new-ui console {tty_path}")
+        self._console_kid = kid
 
     def _start_bridge(self):
         """Load the bridge script inside GDB."""
@@ -281,7 +311,10 @@ class Gdb:
     # --- Execution control ---
 
     def run(self, *args):
-        self.process.command("exec-run")
+        if self.target is not None:
+            self.cont()
+        else:
+            self.process.command("exec-run")
 
     def cont(self):
         self.process.command("exec-continue")
@@ -376,6 +409,12 @@ class Gdb:
 
     def close(self):
         self.process.close()
+        if self.target is not None:
+            self.target.close()
+        if self._console_kid is not None:
+            import subprocess as _sp
+            _sp.run(["kitten", "@", "close-window", "--match",
+                     f"id:{self._console_kid}"], capture_output=True)
 
     def __enter__(self):
         return self
@@ -386,8 +425,15 @@ class Gdb:
 
 # --- Convenience constructors ---
 
-def debug(program, *args, gdb_path="gdb", gdb_args=None, env=None) -> Gdb:
-    """Spawn GDB on a program, start the bridge, and return a Gdb instance.
+def debug(program, *args, gdb_path="gdb", gdb_args=None, env=None,
+          headless=False) -> Gdb:
+    """Spawn a program under gdbserver and connect GDB to it.
+
+    The target runs in a pwntools process tube (gdb.target) with its
+    own stdin/stdout, giving clean IO separation from GDB's MI traffic.
+
+    Unless headless=True, a kitty terminal window is opened with a
+    GDB console UI for interactive commands.
 
     Args:
         program: Path to the executable.
@@ -396,18 +442,38 @@ def debug(program, *args, gdb_path="gdb", gdb_args=None, env=None) -> Gdb:
         gdb_args: Extra command-line arguments for GDB itself
                   (e.g. ["-ex", "set disable-randomization off"]).
         env: Environment dict for the GDB subprocess.
+        headless: If True, skip spawning the kitty console window.
     """
+    from pwn import process as pwnprocess
+
+    # Spawn gdbserver with target
+    gdbserver_cmd = ["gdbserver", "--once", "localhost:0", program]
+    gdbserver_cmd.extend(str(a) for a in args)
+    target = pwnprocess(gdbserver_cmd, env=env)
+
+    # Parse port from gdbserver output: "Listening on port XXXX"
+    line = target.recvline_contains(b"Listening on port")
+    port = int(line.split(b"port ")[-1])
+
+    # Spawn GDB without program, load symbols only
     g = Gdb(gdb_path=gdb_path, env=env)
     extra = list(gdb_args) if gdb_args else []
-    if args:
-        extra.append("--args")
-        extra.extend(str(a) for a in args)
-    g.process.start(program=program, extra_args=extra if extra else None)
+    g.process.start(extra_args=extra if extra else None)
+    g.process.console(f'file {program}')
+
+    # Start bridge, connect to gdbserver
     g._start_bridge()
+    g.process.console(f'target remote localhost:{port}')
+
+    if not headless:
+        g._start_console()
+
+    g.target = target
     return g
 
 
-def attach(pid_or_name, gdb_path="gdb", gdb_args=None, env=None) -> Gdb:
+def attach(pid_or_name, gdb_path="gdb", gdb_args=None, env=None,
+           headless=False) -> Gdb:
     """Attach GDB to a running process (by PID or name).
 
     Args:
@@ -415,6 +481,7 @@ def attach(pid_or_name, gdb_path="gdb", gdb_args=None, env=None) -> Gdb:
         gdb_path: Path to the gdb binary.
         gdb_args: Extra command-line arguments for GDB itself.
         env: Environment dict for the GDB subprocess.
+        headless: If True, skip spawning the kitty console window.
     """
     g = Gdb(gdb_path=gdb_path, env=env)
     extra = list(gdb_args) if gdb_args else None
@@ -437,4 +504,8 @@ def attach(pid_or_name, gdb_path="gdb", gdb_args=None, env=None) -> Gdb:
             raise RuntimeError("pidof not available; pass a PID instead")
 
     g._start_bridge()
+
+    if not headless:
+        g._start_console()
+
     return g
