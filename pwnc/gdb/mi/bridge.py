@@ -179,27 +179,31 @@ def resolve_type(name):
     # PLT entries, and shared-library symbols that lookup_*symbol misses.
     try:
         val = gdb.parse_and_eval(name)
-        t = val.type.strip_typedefs()
-
-        # For symbols without debug info or function types, get address via &name.
-        # Return "function" flag so the client returns the address directly
-        # rather than reading memory at the address.
-        if t.code in (gdb.TYPE_CODE_ERROR, gdb.TYPE_CODE_FUNC):
-            addr_val = gdb.parse_and_eval(f"&{name}")
-            addr = int(addr_val)
+    except gdb.error as e:
+        if "unknown type" in str(e):
+            val = gdb.parse_and_eval(f"&{name}")
+            addr = int(val)
             return (None, addr, "function")
+        else:
+            return None
 
-        # Regular value (variable in a shared library)
-        addr = int(val.address) if val.address else int(val)
-        try:
-            desc = gdb_type_to_pwnc(t)
-        except Exception:
-            desc = None
-        return (desc, addr)
+    t = val.type.strip_typedefs()
+
+    # For symbols without debug info or function types, get address via &name.
+    # Return "function" flag so the client returns the address directly
+    # rather than reading memory at the address.
+    if t.code in (gdb.TYPE_CODE_ERROR, gdb.TYPE_CODE_FUNC):
+        addr_val = gdb.parse_and_eval(f"&{name}")
+        addr = int(addr_val)
+        return (None, addr, "function")
+
+    # Regular value (variable in a shared library)
+    addr = int(val.address) if val.address else int(val)
+    try:
+        desc = gdb_type_to_pwnc(t)
     except Exception:
-        pass
-
-    return None
+        desc = None
+    return (desc, addr)
 
 
 def gdb_type_to_pwnc(gdb_type, _cache=None):
@@ -270,12 +274,6 @@ def get_endian():
     if "little" in endian:
         return "little"
     return "big"
-
-
-@handler("get_pointer_size")
-def get_pointer_size():
-    void_ptr = gdb.lookup_type("void").pointer()
-    return void_ptr.sizeof * 8
 
 
 # --- Dispatch entry point ---
