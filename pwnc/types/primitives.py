@@ -55,6 +55,11 @@ class Ptr(Type):
     def __str__(self):
         if self.child is None:
             return "void*"
+        from .containers import Struct, Union
+        if isinstance(self.child, Struct):
+            return f"struct {self.child.name}*"
+        if isinstance(self.child, Union):
+            return f"union {self.child.name}*"
         return f"{self.child}*"
 
     def __repr__(self):

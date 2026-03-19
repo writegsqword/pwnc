@@ -105,18 +105,26 @@ def format_type(ty, depth=None, filter=None, _indent=0, _seen=None):
     return str(ty)
 
 
-def _format_container(ty, depth, filter, indent, seen, base_offset=0):
+def _format_container(ty, depth, filter, indent, seen, base_offset=0, _ancestors=None):
+    if _ancestors is None:
+        _ancestors = set()
+
     kind = "struct" if isinstance(ty, Struct) else "union"
     prefix = "    " * indent
     inner_prefix = "    " * (indent + 1)
+
+    ty_id = id(ty)
+
+    # Cycle detection: if this type is an ancestor, always collapse
+    if ty_id in _ancestors:
+        return f"{prefix}{kind} {ty.name} {{ ... }}"
 
     mode_str = f", {ty.mode}" if isinstance(ty, Struct) else ""
     header = f"{prefix}{kind} {ty.name} {{  /* 0x{ty.nbytes:02x} bytes{mode_str} */"
 
     lines = [header]
 
-    ty_id = id(ty)
-    # Only deduplicate when depth is limited; at depth=None (show all), always expand
+    # Deduplication for limited-depth display
     is_repeat = depth is not None and ty_id in seen
     seen.add(ty_id)
 
@@ -125,6 +133,7 @@ def _format_container(ty, depth, filter, indent, seen, base_offset=0):
         return "\n".join(lines)
 
     child_depth = depth - 1 if depth is not None else None
+    _ancestors.add(ty_id)
 
     # build a set of padding offsets for display
     pad_entries = []
@@ -161,10 +170,10 @@ def _format_container(ty, depth, filter, indent, seen, base_offset=0):
             # nested container
             if isinstance(ftype, (Struct, Union)):
                 nested_kind = "struct" if isinstance(ftype, Struct) else "union"
-                if (child_depth is not None and (ftype_id_seen(ftype, seen) or child_depth <= 1)):
+                if id(ftype) in _ancestors or (child_depth is not None and (ftype_id_seen(ftype, seen) or child_depth <= 1)):
                     lines.append(f"{inner_prefix}/* {offset_str} */ {nested_kind} {ftype.name} {{ ... }} {fname};")
                 else:
-                    nested = _format_container(ftype, child_depth, None, indent + 1, seen, abs_off)
+                    nested = _format_container(ftype, child_depth, None, indent + 1, seen, abs_off, _ancestors)
                     nested_lines = nested.split("\n")
                     if len(nested_lines) == 1:
                         # Collapsed to single line
@@ -191,6 +200,7 @@ def _format_container(ty, depth, filter, indent, seen, base_offset=0):
                 else:
                     lines.append(f"{inner_prefix}/* {offset_str} */ {type_label} {fname};")
 
+    _ancestors.discard(ty_id)
     lines.append(f"{inner_prefix}/* total size: 0x{ty.nbytes:x} */")
     lines.append(f"{prefix}}}")
     return "\n".join(lines)
