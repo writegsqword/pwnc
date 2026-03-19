@@ -170,11 +170,34 @@ class Value:
         raise AttributeError(f"Value has no attribute '{name}'")
 
     def __getitem__(self, index):
+        if isinstance(self._type, Ptr):
+            if self._type.child is None:
+                raise TypeError("cannot dereference void pointer")
+            addr = self._resolve()
+            child = self._type.child
+            target_addr = addr + index * child.nbytes
+            new_provider = self._provider.rebase(target_addr)
+            child_val = Value(child, new_provider, 0)
+            if isinstance(child, (Int, Float, Double, Ptr, Enum)):
+                return child_val._resolve()
+            if isinstance(child, Array):
+                return ArrayValue(child, new_provider, 0)
+            return child_val
         if isinstance(self._type, Array):
             return ArrayValue(self._type, self._provider, self._base_offset)[index]
         raise TypeError(f"Value of type {type(self._type).__name__} is not subscriptable")
 
     def __setitem__(self, index, value):
+        if isinstance(self._type, Ptr):
+            if self._type.child is None:
+                raise TypeError("cannot dereference void pointer")
+            addr = self._resolve()
+            child = self._type.child
+            target_addr = addr + index * child.nbytes
+            new_provider = self._provider.rebase(target_addr)
+            child_val = Value(child, new_provider, 0)
+            child_val._write(child, 0, value)
+            return
         if isinstance(self._type, Array):
             ArrayValue(self._type, self._provider, self._base_offset)[index] = value
             return

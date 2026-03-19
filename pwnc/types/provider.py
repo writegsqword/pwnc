@@ -15,6 +15,9 @@ class BytesProvider(ABC):
     def write(self, offset: int, data: bytes) -> None:
         raise NotImplementedError
 
+    def rebase(self, addr: int) -> 'BytesProvider':
+        raise NotImplementedError
+
 
 class BufferProvider(BytesProvider):
     def __init__(self, data, byteorder=ByteOrder.Little):

@@ -178,6 +178,9 @@ class GdbRemoteBytesProvider(BytesProvider):
         self._conn.call("write_memory",
                         self._base_addr + offset, bytes(data))
 
+    def rebase(self, addr):
+        return GdbRemoteBytesProvider(self._conn, addr, self.byteorder)
+
 
 # --- Symbol accessor ---
 
