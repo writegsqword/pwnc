@@ -58,13 +58,12 @@ class Value:
 
     def ref(self):
         ptrbits = self._provider.ptrbits
-        ptr_type = Ptr(self._type, bits=ptrbits)
         addr = self.address
         bo = self._provider.byteorder
         byte_order = "little" if bo == ByteOrder.Little else "big"
         data = addr.to_bytes(ptrbits // 8, byte_order)
         buf = BufferProvider(bytearray(data), bo, ptrbits)
-        return RefValue(ptr_type, buf, 0, self._provider, addr)
+        return RefValue(self._type, buf, 0, self._provider)
 
     def _resolve(self):
         """Resolve this value to a Python object (int, float, etc.)."""
@@ -143,6 +142,14 @@ class Value:
             raise TypeError(f"cannot write to field of type {type(ty).__name__}")
 
     def __setattr__(self, name, value):
+        for cls in type(self).__mro__:
+            if name in cls.__dict__:
+                desc = cls.__dict__[name]
+                if isinstance(desc, property) and desc.fset is not None:
+                    desc.fset(self, value)
+                    return
+                break
+
         ty = self._type
         if not isinstance(ty, (Struct, Union)):
             raise AttributeError(f"cannot set fields on {type(ty).__name__} value")
@@ -172,8 +179,8 @@ class Value:
             bf = getattr(ty, name)  # returns BoundField
             new_offset = self._base_offset + bf.offset
 
-            # if child is a primitive, return a typed value
-            if isinstance(bf._type, (Int, Float, Double, Enum)):
+            # if child is a primitive or pointer, return a typed value
+            if isinstance(bf._type, (Int, Float, Double, Enum, Ptr)):
                 return _typed_value(bf._type, self._provider, new_offset,
                                     bf.bit_offset if isinstance(bf._type, Bits) else None)
 
@@ -187,6 +194,8 @@ class Value:
         raise AttributeError(f"Value has no attribute '{name}'")
 
     def __getitem__(self, index):
+        if isinstance(index, str):
+            return self.__getattr__(index)
         if isinstance(self._type, Ptr):
             if self._type.child is None:
                 raise TypeError("cannot dereference void pointer")
@@ -194,16 +203,18 @@ class Value:
             child = self._type.child
             target_addr = addr + index * child.nbytes
             new_provider = self._provider.rebase(target_addr)
-            if isinstance(child, (Int, Float, Double, Enum)):
+            if isinstance(child, (Int, Float, Double, Enum, Ptr)):
                 return _typed_value(child, new_provider, 0)
             if isinstance(child, Array):
                 return ArrayValue(child, new_provider, 0)
-            return type(self)(child, new_provider, 0)
+            return Value(child, new_provider, 0)
         if isinstance(self._type, Array):
             return ArrayValue(self._type, self._provider, self._base_offset)[index]
         raise TypeError(f"Value of type {type(self._type).__name__} is not subscriptable")
 
     def __setitem__(self, index, value):
+        if isinstance(index, str):
+            return self.__setattr__(index, value)
         if isinstance(self._type, Ptr):
             if self._type.child is None:
                 raise TypeError("cannot dereference void pointer")
@@ -266,168 +277,6 @@ class Value:
             return other._to_python()
         return other
 
-    def _ptr_result(self, addr):
-        new_provider = self._provider.rebase(addr)
-        return type(self)(self._type, new_provider, 0)
-
-    # --- Arithmetic operators ---
-
-    def __add__(self, other):
-        if isinstance(self._type, Ptr):
-            n = self._other_val(other)
-            child = self._type.child
-            if child is None:
-                return self._ptr_result(self._resolve() + n)
-            return self._ptr_result(self._resolve() + n * child.nbytes)
-        return self._to_python() + self._other_val(other)
-
-    def __radd__(self, other):
-        if isinstance(self._type, Ptr):
-            child = self._type.child
-            if child is None:
-                return self._ptr_result(other + self._resolve())
-            return self._ptr_result(other * child.nbytes + self._resolve())
-        return other + self._to_python()
-
-    def __sub__(self, other):
-        if isinstance(self._type, Ptr):
-            if isinstance(other, Value) and isinstance(other._type, Ptr):
-                child = self._type.child
-                if child is None or child.nbytes == 0:
-                    return self._resolve() - other._resolve()
-                return (self._resolve() - other._resolve()) // child.nbytes
-            n = self._other_val(other)
-            child = self._type.child
-            if child is None:
-                return self._ptr_result(self._resolve() - n)
-            return self._ptr_result(self._resolve() - n * child.nbytes)
-        return self._to_python() - self._other_val(other)
-
-    def __rsub__(self, other):
-        if isinstance(self._type, Ptr):
-            return self._ptr_result(other - self._resolve())
-        return other - self._to_python()
-
-    def __mul__(self, other):
-        if isinstance(self._type, Ptr):
-            return self._ptr_result(self._resolve() * self._other_val(other))
-        return self._to_python() * self._other_val(other)
-
-    def __rmul__(self, other):
-        if isinstance(self._type, Ptr):
-            return self._ptr_result(other * self._resolve())
-        return other * self._to_python()
-
-    def __truediv__(self, other):
-        if isinstance(self._type, Ptr):
-            return self._ptr_result(int(self._resolve() / self._other_val(other)))
-        return self._to_python() / self._other_val(other)
-
-    def __rtruediv__(self, other):
-        if isinstance(self._type, Ptr):
-            return self._ptr_result(int(other / self._resolve()))
-        return other / self._to_python()
-
-    def __floordiv__(self, other):
-        if isinstance(self._type, Ptr):
-            return self._ptr_result(self._resolve() // self._other_val(other))
-        return self._to_python() // self._other_val(other)
-
-    def __rfloordiv__(self, other):
-        if isinstance(self._type, Ptr):
-            return self._ptr_result(other // self._resolve())
-        return other // self._to_python()
-
-    def __mod__(self, other):
-        if isinstance(self._type, Ptr):
-            return self._ptr_result(self._resolve() % self._other_val(other))
-        return self._to_python() % self._other_val(other)
-
-    def __rmod__(self, other):
-        if isinstance(self._type, Ptr):
-            return self._ptr_result(other % self._resolve())
-        return other % self._to_python()
-
-    def __pow__(self, other):
-        if isinstance(self._type, Ptr):
-            return self._ptr_result(self._resolve() ** self._other_val(other))
-        return self._to_python() ** self._other_val(other)
-
-    def __rpow__(self, other):
-        if isinstance(self._type, Ptr):
-            return self._ptr_result(other ** self._resolve())
-        return other ** self._to_python()
-
-    # --- Bitwise operators ---
-
-    def __and__(self, other):
-        if isinstance(self._type, Ptr):
-            return self._ptr_result(self._resolve() & self._other_val(other))
-        return self._to_python() & self._other_val(other)
-
-    def __rand__(self, other):
-        if isinstance(self._type, Ptr):
-            return self._ptr_result(other & self._resolve())
-        return other & self._to_python()
-
-    def __or__(self, other):
-        if isinstance(self._type, Ptr):
-            return self._ptr_result(self._resolve() | self._other_val(other))
-        return self._to_python() | self._other_val(other)
-
-    def __ror__(self, other):
-        if isinstance(self._type, Ptr):
-            return self._ptr_result(other | self._resolve())
-        return other | self._to_python()
-
-    def __xor__(self, other):
-        if isinstance(self._type, Ptr):
-            return self._ptr_result(self._resolve() ^ self._other_val(other))
-        return self._to_python() ^ self._other_val(other)
-
-    def __rxor__(self, other):
-        if isinstance(self._type, Ptr):
-            return self._ptr_result(other ^ self._resolve())
-        return other ^ self._to_python()
-
-    def __lshift__(self, other):
-        if isinstance(self._type, Ptr):
-            return self._ptr_result(self._resolve() << self._other_val(other))
-        return self._to_python() << self._other_val(other)
-
-    def __rlshift__(self, other):
-        if isinstance(self._type, Ptr):
-            return self._ptr_result(other << self._resolve())
-        return other << self._to_python()
-
-    def __rshift__(self, other):
-        if isinstance(self._type, Ptr):
-            return self._ptr_result(self._resolve() >> self._other_val(other))
-        return self._to_python() >> self._other_val(other)
-
-    def __rrshift__(self, other):
-        if isinstance(self._type, Ptr):
-            return self._ptr_result(other >> self._resolve())
-        return other >> self._to_python()
-
-    # --- Unary operators ---
-
-    def __neg__(self):
-        if isinstance(self._type, Ptr):
-            return self._ptr_result(-self._resolve())
-        return -self._to_python()
-
-    def __pos__(self):
-        if isinstance(self._type, Ptr):
-            return self._ptr_result(self._resolve())
-        return +self._to_python()
-
-    def __invert__(self):
-        if isinstance(self._type, Ptr):
-            mask = (1 << self._type.nbits) - 1
-            return self._ptr_result(self._resolve() ^ mask)
-        return ~self._to_python()
-
     # --- Comparison operators ---
 
     def __eq__(self, other):
@@ -478,7 +327,7 @@ class ArrayValue(Value):
         child = self._type.child
         elem_offset = self._base_offset + index * child.nbytes
 
-        if isinstance(child, (Int, Float, Double, Enum)):
+        if isinstance(child, (Int, Float, Double, Enum, Ptr)):
             return _typed_value(child, self._provider, elem_offset)
 
         return Value(child, self._provider, elem_offset)
@@ -508,54 +357,54 @@ class ArrayValue(Value):
 
 
 class RefValue(Value):
-    def __init__(self, type, provider, base_offset, orig_provider, addr=None):
+    def __init__(self, type, provider, base_offset, orig_provider):
+        type = Ptr(type, bits=provider.ptrbits)
         super().__init__(type, provider, base_offset)
         object.__setattr__(self, '_orig_provider', orig_provider)
-        if addr is not None:
-            object.__setattr__(self, '_ref_addr', addr)
-
-    def _resolve(self):
-        if isinstance(self._type, Ptr) and hasattr(self, '_ref_addr'):
-            return self._ref_addr
-        return super()._resolve()
 
     def cast(self, target):
         if isinstance(target, Value):
             target = target._type
         return RefValue(target, self._provider, self._base_offset,
-                        self._orig_provider, self._ref_addr)
+                        self._orig_provider)
 
-    def _ptr_result(self, addr):
-        return RefValue(self._type, self._provider, self._base_offset,
-                        self._orig_provider, addr)
+    @property
+    def val(self):
+        return self._resolve()
+
+    def _wrap(self, raw):
+        val = int(raw) & ((1 << self._type.nbits) - 1)
+        bo = self._provider.byteorder
+        byte_order = "little" if bo == ByteOrder.Little else "big"
+        data = val.to_bytes(self._type.nbytes, byte_order)
+        buf = BufferProvider(bytearray(data), bo, self._provider.ptrbits)
+        return RefValue(self._type.child, buf, 0, self._orig_provider)
 
     def __getitem__(self, index):
-        if isinstance(self._type, Ptr):
-            if self._type.child is None:
-                raise TypeError("cannot dereference void pointer")
-            addr = self._resolve()
-            child = self._type.child
-            target_addr = addr + index * child.nbytes
-            new_provider = self._orig_provider.rebase(target_addr)
-            if isinstance(child, (Int, Float, Double, Enum)):
-                return _typed_value(child, new_provider, 0)
-            if isinstance(child, Array):
-                return ArrayValue(child, new_provider, 0)
-            return Value(child, new_provider, 0)
-        return super().__getitem__(index)
+        child = self._type.child
+        if child is None:
+            raise TypeError("cannot dereference void pointer")
+        target_addr = self._resolve() + index * child.nbytes
+        new_provider = self._orig_provider.rebase(target_addr)
+        if isinstance(child, (Int, Float, Double, Enum, Ptr)):
+            return _typed_value(child, new_provider, 0)
+        if isinstance(child, Array):
+            return ArrayValue(child, new_provider, 0)
+        return Value(child, new_provider, 0)
 
     def __setitem__(self, index, value):
-        if isinstance(self._type, Ptr):
-            if self._type.child is None:
-                raise TypeError("cannot dereference void pointer")
-            addr = self._resolve()
-            child = self._type.child
-            target_addr = addr + index * child.nbytes
-            new_provider = self._orig_provider.rebase(target_addr)
-            child_val = Value(child, new_provider, 0)
-            child_val._write(child, 0, value)
-            return
-        super().__setitem__(index, value)
+        child = self._type.child
+        if child is None:
+            raise TypeError("cannot dereference void pointer")
+        target_addr = self._resolve() + index * child.nbytes
+        new_provider = self._orig_provider.rebase(target_addr)
+        child_val = Value(child, new_provider, 0)
+        child_val._write(child, 0, value)
+
+    def __neg__(self):    return self._wrap(-self.val)
+    def __pos__(self):    return self._wrap(self.val)
+    def __invert__(self): return self._wrap(~self.val)
+    def __abs__(self):    return self._wrap(abs(self.val))
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -732,9 +581,58 @@ _install_ops(IntValue, _COMMON_OPS + _BITWISE_OPS)
 _install_ops(FloatValue, _COMMON_OPS)
 _install_ops(DoubleValue, _COMMON_OPS)
 _install_ops(EnumValue, _COMMON_OPS + _BITWISE_OPS)
+_install_ops(RefValue, _COMMON_OPS + _BITWISE_OPS)
+
+
+def _ref_add(self, other):
+    n = self._other_val(other)
+    child = self._type.child
+    stride = child.nbytes if child is not None else 1
+    return self._wrap(self.val + n * stride)
+
+def _ref_radd(self, other):
+    return _ref_add(self, other)
+
+def _ref_iadd(self, other):
+    n = self._other_val(other)
+    child = self._type.child
+    stride = child.nbytes if child is not None else 1
+    wrapped = self._wrap(self.val + n * stride)
+    self._write(self._type, self._base_offset, wrapped.val)
+    return self
+
+def _ref_sub(self, other):
+    if isinstance(other, RefValue):
+        child = self._type.child
+        stride = child.nbytes if child is not None and child.nbytes != 0 else 1
+        return (self.val - other.val) // stride
+    n = self._other_val(other)
+    child = self._type.child
+    stride = child.nbytes if child is not None else 1
+    return self._wrap(self.val - n * stride)
+
+def _ref_rsub(self, other):
+    return self._other_val(other) - self.val
+
+def _ref_isub(self, other):
+    n = self._other_val(other)
+    child = self._type.child
+    stride = child.nbytes if child is not None else 1
+    wrapped = self._wrap(self.val - n * stride)
+    self._write(self._type, self._base_offset, wrapped.val)
+    return self
+
+RefValue.__add__ = _ref_add
+RefValue.__radd__ = _ref_radd
+RefValue.__iadd__ = _ref_iadd
+RefValue.__sub__ = _ref_sub
+RefValue.__rsub__ = _ref_rsub
+RefValue.__isub__ = _ref_isub
 
 
 def _typed_value(ty, provider, offset, bit_offset=None):
+    if isinstance(ty, Ptr):
+        return RefValue(ty.child, provider, offset, provider)
     if isinstance(ty, Enum):
         return EnumValue(ty, provider, offset)
     if isinstance(ty, Float):
