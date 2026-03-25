@@ -269,7 +269,7 @@ class Gdb:
         os.mkfifo(fifo)
 
         self._console_proc = _sp.Popen(
-            ["kitty", "-e", "sh", "-c", f"tty > {fifo}; exec sleep infinity"],
+            ["kitty", "-e", "sh", "-c", f"tty > {fifo}; exec sleep infinity < /dev/null > /dev/null 2>&1"],
         )
 
         with open(fifo) as f:
