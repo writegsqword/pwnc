@@ -61,7 +61,9 @@ def hash_file(path: Path) -> str:
 
 @functools.cache
 def possible_binaries():
-    return find_recursive(".*", callback=binary_filter)
+    ps = find_recursive(".*", callback=binary_filter)
+    err.info(f"possible binaries: {ps}")
+    return ps
 
 
 def establish_connection(host: str, port: int) -> None | socket.socket:
@@ -358,6 +360,8 @@ def handle_docker(args: Args):
     runner = ["docker", "run", "-d", "-q"]
     if args.privileged:
         runner.append("--privileged")
+    else:
+        runner.append("--cap-add=SYS_PTRACE")
 
     cmd = runner + [tag]
     err.info(f"run: {' '.join(cmd)}")
@@ -386,6 +390,7 @@ def handle_docker(args: Args):
             err.warn("container failed to start or exited")
             return False
         
+        time.sleep(0.5)
         container = Container(id)
         ports = container.get_ports()
         err.info(f"found ports: {ports}")
@@ -413,6 +418,7 @@ def handle_docker(args: Args):
             sock = establish_connection("127.0.0.1", port)
             socks.append(sock)
 
+        time.sleep(0.5)
         from_docker_container(id)
         return True
     finally:
