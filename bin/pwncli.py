@@ -292,5 +292,5 @@ try:
         case "swarm":
             import pwnc.commands.swarm
             pwnc.commands.swarm.command(args)
-except RuntimeError:
-    pass
+except RuntimeError as e:
+    print(e)
