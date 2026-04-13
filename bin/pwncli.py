@@ -55,6 +55,7 @@ def get_main_parser():
     Command: init
     """
     subparser = subparsers.add_parser("init")
+    subparser.add_argument("--privileged", action="store_true")
 
     """
     Command: unpack
