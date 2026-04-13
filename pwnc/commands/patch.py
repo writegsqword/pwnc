@@ -31,7 +31,7 @@ def command(args):
             little_endian = False
         case _:
             little_endian = True
-    elf = ELF(raw_elf_bytes, args.bits, little_endian)
+    elf = ELF(raw_elf_bytes, args.bits, little_endian, readonly=False)
     outfile = args.outfile or args.file
 
     dynamic = elf.section_from_name(b".dynamic")
