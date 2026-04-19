@@ -1,7 +1,7 @@
 from ...util import *
 from ... import err
 from ...minelf import ELF
-from typing import NamedTuple
+from typing import NamedTuple, override
 import json
 import time
 import socket
@@ -115,6 +115,7 @@ class Container:
             self.direct = False
 
 
+    @staticmethod
     def get_hostpid(id: str):
         return int(run(["docker", "inspect", "--format", "{{.State.Pid}}", id], shell=False, capture_output=True).stdout)
     
@@ -177,7 +178,7 @@ class Container:
             return os.listdir(path)
         else:
             out = self.exec(["ls"] + options + [path.as_posix()])
-            if out.returncode != 0:
+            if out.returncode != 0 and len(out.stdout) > 0:
                 err.fatal(f"failed to list {path}")
             return out.stdout.strip().splitlines()
         
@@ -188,7 +189,7 @@ class Container:
         if self.direct:
             def file_type_filter(path):
                 return path.is_file() or path.is_symlink()
-            return find_recursive(".*", callback=file_type_filter, target=self.root / root)
+            return [p.relative_to(self.root) for p in find_recursive(".*", callback=file_type_filter, target=self.root / root)]
         else:
             root = Path("/") / root
             out = self.exec(["find", root.as_posix() + "/", "(", "-type", "f", "-o", "-type", "l", ")"])
@@ -251,6 +252,18 @@ class Container:
                 ports.add(port)
 
         return ports
+    
+
+class ContainerWithUID(Container):
+    def __init__(self, id: str, uid : int):
+        super().__init__(id)
+        self.uid = uid
+        
+    @override
+    def exec(self, cmd: list[str]):
+        cmd = ["docker", "exec", "-u", str(self.uid), self.id] + cmd
+        err.info(f"running: {' '.join(cmd)}")
+        return run(cmd, shell=False, check=False, capture_output=True, encoding=None)
 
 
 def from_running(container: Container, pid: int):
@@ -323,13 +336,22 @@ def from_docker_container(id: str):
         pids = container.get_pids()
 
         for pid in pids:
+            status_path = Path("/") / "proc" / str(pid) / "status"
+            proc_status = container.read_file(status_path)
+            lines = proc_status.splitlines()
+            lines = list(filter(lambda l: b"Uid:" in l, lines))
+            # todo: check if taking the first uid is correct
+            err.info(f"uid of proc: {pid} - {str(lines)}")
+            uid = int(lines[0].split()[1])
+
+            uid_container = ContainerWithUID(id, uid)
             src = Path("/") / "proc" / str(pid) / "exe"
 
-            if not container.test_file(src):
+            if not uid_container.test_file(src):
                 err.warn(f"failed to access {src}")
                 continue
 
-            container.copy_file(src, copy)
+            uid_container.copy_file(src, copy)
             copy_hash = hash_file(copy)
             for bin in bins:
                 hash = hashes.get(bin)
@@ -337,7 +359,7 @@ def from_docker_container(id: str):
                     hash = hash_file(bin)
                     hashes[bin] = hash
                 if copy_hash == hash:
-                    matches.append((container, pid))
+                    matches.append((uid_container, pid))
                     break
 
         for match in matches:
